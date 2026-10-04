@@ -24,13 +24,14 @@
  *    DnDUIX11 drags through Xwayland on a Wayland session, which depends on
  *    the compositor's bridge between X11 and Wayland drags. Some compositors
  *    (KWin) don't carry those drags across reliably. This class does the
- *    same job with Wayland protocols directly: a wlr-layer-shell surface is
- *    the drag detection window, a wl_data_source started from a uinput
+ *    same job with Wayland protocols directly: the input region of a
+ *    wlr-layer-shell surface covering the output is the drag detection
+ *    window, a wl_data_source started from a uinput
  *    button press is the host-to-guest drag, and the surface's
  *    wl_data_device events detect guest-to-host drags.
  *
- *    It needs the compositor to offer zwlr_layer_shell_v1, so it is only
- *    used when IsSupported() says so; otherwise DnDUIX11 is used.
+ *    It needs the compositor to offer zwlr_layer_shell_v1 and wp_viewporter,
+ *    so it is only used when IsSupported() says so; otherwise DnDUIX11 is used.
  */
 
 #ifndef __DND_UI_WAYLAND_H__
@@ -68,6 +69,8 @@ struct wl_data_source;
 struct wl_data_offer;
 struct zwlr_layer_shell_v1;
 struct zwlr_layer_surface_v1;
+struct wp_viewporter;
+struct wp_viewport;
 
 class DnDUIWayland
    : public DnDUI,
@@ -95,7 +98,8 @@ public:
    void OnPointerEnter(struct wl_surface *surface);
    void OnPointerLeave(struct wl_surface *surface);
    void OnPointerButton(uint32 serial, uint32 state);
-   void OnLayerConfigure(struct zwlr_layer_surface_v1 *ls, uint32 serial);
+   void OnLayerConfigure(struct zwlr_layer_surface_v1 *ls, uint32 serial,
+                         uint32 width, uint32 height);
    void OnSourceSend(struct wl_data_source *source, const char *mimeType,
                      int32 fd);
    void OnSourceAction(struct wl_data_source *source, uint32 action);
@@ -163,6 +167,8 @@ private:
     * Callbacks for showing/hiding detection window.
     */
    void OnUpdateDetWnd(bool bShow, int32 x, int32 y);
+   void OnStateChanged(GUEST_DND_STATE state);
+   void ReleaseHeldButton();
    void OnDestMoveDetWndToMousePos();
 
    /*
@@ -200,11 +206,13 @@ private:
    struct wl_data_device_manager *mDataDeviceManager;
    struct wl_data_device *mDataDevice;
    struct zwlr_layer_shell_v1 *mLayerShell;
+   struct wp_viewporter *mViewporter;
    GSource *mSource;
 
    /* Detection surface. */
    struct wl_surface *mSurface;
    struct zwlr_layer_surface_v1 *mLayerSurface;
+   struct wp_viewport *mViewport;
    struct wl_buffer *mBuffer;
    bool mConfigured;
    bool mDetWndShown;
@@ -250,6 +258,8 @@ private:
    bool mGHDnDDataReceived;
    int mNumPendingRequest;
    unsigned long mDestDropTime;
+   /* The uinput button is held to keep a guest drag alive; see OnStateChanged. */
+   bool mHoldingButton;
 
    /* GLib watches for in-flight data transfers, removed on destruction. */
    std::vector<guint> mIoWatches;

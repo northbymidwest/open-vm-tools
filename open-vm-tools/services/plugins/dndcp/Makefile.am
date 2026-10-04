@@ -147,10 +147,13 @@ libdndcp_la_SOURCES  += dndUIWayland.cpp
 nodist_libdndcp_la_SOURCES =
 nodist_libdndcp_la_SOURCES += wlr-layer-shell-unstable-v1-protocol.c
 nodist_libdndcp_la_SOURCES += xdg-shell-protocol.c
+nodist_libdndcp_la_SOURCES += viewporter-protocol.c
 
 BUILT_SOURCES += wlr-layer-shell-unstable-v1-client-protocol.h
 BUILT_SOURCES += wlr-layer-shell-unstable-v1-protocol.c
 BUILT_SOURCES += xdg-shell-protocol.c
+BUILT_SOURCES += viewporter-client-protocol.h
+BUILT_SOURCES += viewporter-protocol.c
 
 wlr-layer-shell-unstable-v1-client-protocol.h: $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml
 	$(WAYLAND_SCANNER) client-header $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml $@
@@ -160,8 +163,15 @@ wlr-layer-shell-unstable-v1-protocol.c: $(srcdir)/wayland/wlr-layer-shell-unstab
 
 xdg-shell-protocol.c: $(srcdir)/wayland/xdg-shell.xml
 	$(WAYLAND_SCANNER) private-code $(srcdir)/wayland/xdg-shell.xml $@
+
+viewporter-client-protocol.h: $(srcdir)/wayland/viewporter.xml
+	$(WAYLAND_SCANNER) client-header $(srcdir)/wayland/viewporter.xml $@
+
+viewporter-protocol.c: $(srcdir)/wayland/viewporter.xml
+	$(WAYLAND_SCANNER) private-code $(srcdir)/wayland/viewporter.xml $@
 endif
 
 EXTRA_DIST =
 EXTRA_DIST += wayland/wlr-layer-shell-unstable-v1.xml
 EXTRA_DIST += wayland/xdg-shell.xml
+EXTRA_DIST += wayland/viewporter.xml

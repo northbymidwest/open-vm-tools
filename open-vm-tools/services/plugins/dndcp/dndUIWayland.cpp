@@ -22,10 +22,13 @@
  *    Native Wayland DnD UI. Mirrors DnDUIX11's handling of the common DnD
  *    layer's signals, using Wayland protocols in place of X11 and GTK+ DnD:
  *
- *    - The drag detection window is a zwlr_layer_shell_v1 surface on the
- *      overlay layer, because only layer surfaces can be placed at exact
- *      screen coordinates. It stays mapped and fully transparent; "hiding"
- *      it empties its input region.
+ *    - The drag detection window is the input region of a transparent
+ *      zwlr_layer_shell_v1 surface covering the whole output on the overlay
+ *      layer. Showing it at (x, y) sets the input region to that rectangle
+ *      and hiding it empties the region. The surface itself never moves:
+ *      a compositor may apply a layer surface's new position some time after
+ *      the commit, while the input region is plain surface state, in effect
+ *      as soon as the commit is processed.
  *
  *    - Host-to-guest: the uinput pointer (fakeMouseWayland) presses on the
  *      detection surface, and the serial of that press starts a
@@ -44,6 +47,7 @@
 #include <fcntl.h>
 /* lib/include/poll.h is VMware's Poll API, not the system header. */
 #include <sys/poll.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -60,6 +64,7 @@
 #define namespace namespace_
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
+#include "viewporter-client-protocol.h"
 
 #include "dndUIWayland.h"
 #include "guestDnDCPMgr.hh"
@@ -76,8 +81,8 @@ extern "C" {
 #include "str.h"
 
 /*
- * The detection surface is twice the detection window width, like
- * DnDUIX11::OnUpdateDetWnd's SetGeometry.
+ * The detection window (the surface's input region while shown) is twice
+ * the detection window width, like DnDUIX11::OnUpdateDetWnd's SetGeometry.
  */
 #define DET_WND_SIZE (DRAG_DET_WINDOW_WIDTH * 2)
 
@@ -209,7 +214,7 @@ static void
 LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t serial,
                uint32_t w, uint32_t h)
 {
-   UI(data)->OnLayerConfigure(ls, serial);
+   UI(data)->OnLayerConfigure(ls, serial, w, h);
 }
 
 static void
@@ -563,9 +568,11 @@ DnDUIWayland::DnDUIWayland(ToolsAppCtx *ctx)
       mDataDeviceManager(NULL),
       mDataDevice(NULL),
       mLayerShell(NULL),
+      mViewporter(NULL),
       mSource(NULL),
       mSurface(NULL),
       mLayerSurface(NULL),
+      mViewport(NULL),
       mBuffer(NULL),
       mConfigured(false),
       mDetWndShown(false),
@@ -597,7 +604,8 @@ DnDUIWayland::DnDUIWayland(ToolsAppCtx *ctx)
       mGHDnDInProgress(false),
       mGHDnDDataReceived(false),
       mNumPendingRequest(0),
-      mDestDropTime(0)
+      mDestDropTime(0),
+      mHoldingButton(false)
 {
    TRACE_CALL();
    InitListeners();
@@ -631,6 +639,7 @@ DnDUIWayland::~DnDUIWayland()
       }
    }
    ResetUI();
+   ReleaseHeldButton();
 
    while (!mIoWatches.empty()) {
       guint watch = mIoWatches.back();
@@ -683,7 +692,8 @@ DnDUIWayland::IsSupported()
    struct Globals {
       bool layerShell;
       bool dataDevice;
-   } globals = { false, false };
+      bool viewporter;
+   } globals = { false, false, false };
 
    static struct wl_registry_listener probe;
    probe.global = [](void *data, struct wl_registry *reg, uint32_t name,
@@ -693,6 +703,8 @@ DnDUIWayland::IsSupported()
          g->layerShell = true;
       } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0) {
          g->dataDevice = version >= 3;
+      } else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
+         g->viewporter = true;
       }
    };
    probe.global_remove = RegistryGlobalRemove;
@@ -703,9 +715,10 @@ DnDUIWayland::IsSupported()
    wl_registry_destroy(reg);
    wl_display_disconnect(display);
 
-   g_debug("%s: layer shell %d, data device v3 %d\n", __FUNCTION__,
-           globals.layerShell, globals.dataDevice);
-   return globals.layerShell && globals.dataDevice;
+   g_debug("%s: layer shell %d, data device v3 %d, viewporter %d\n",
+           __FUNCTION__, globals.layerShell, globals.dataDevice,
+           globals.viewporter);
+   return globals.layerShell && globals.dataDevice && globals.viewporter;
 }
 
 
@@ -769,6 +782,7 @@ DnDUIWayland::Init()
    CONNECT_SIGNAL(mDnD, moveMouseChanged,      OnMoveMouse);
    CONNECT_SIGNAL(mDnD, privDropChanged,       OnPrivateDrop);
    CONNECT_SIGNAL(mDnD, updateDetWndChanged,   OnUpdateDetWnd);
+   CONNECT_SIGNAL(mDnD, stateChanged,          OnStateChanged);
 
 #undef CONNECT_SIGNAL
 
@@ -809,11 +823,12 @@ DnDUIWayland::Connect()
 
    if (   mCompositor == NULL || mShm == NULL || mSeat == NULL
        || mOutput == NULL || mDataDeviceManager == NULL
-       || mLayerShell == NULL || mPointer == NULL) {
+       || mLayerShell == NULL || mViewporter == NULL || mPointer == NULL) {
       g_debug("%s: missing globals: compositor %p shm %p seat %p output %p "
-              "data device manager %p layer shell %p pointer %p\n",
+              "data device manager %p layer shell %p viewporter %p "
+              "pointer %p\n",
               __FUNCTION__, mCompositor, mShm, mSeat, mOutput,
-              mDataDeviceManager, mLayerShell, mPointer);
+              mDataDeviceManager, mLayerShell, mViewporter, mPointer);
       return false;
    }
    if (mScreenWidth <= 0 || mScreenHeight <= 0) {
@@ -862,6 +877,10 @@ DnDUIWayland::Disconnect()
       g_source_unref(mSource);
       mSource = NULL;
    }
+   if (mViewport) {
+      wp_viewport_destroy(mViewport);
+      mViewport = NULL;
+   }
    if (mLayerSurface) {
       zwlr_layer_surface_v1_destroy(mLayerSurface);
       mLayerSurface = NULL;
@@ -885,6 +904,10 @@ DnDUIWayland::Disconnect()
    if (mLayerShell) {
       zwlr_layer_shell_v1_destroy(mLayerShell);
       mLayerShell = NULL;
+   }
+   if (mViewporter) {
+      wp_viewporter_destroy(mViewporter);
+      mViewporter = NULL;
    }
    if (mDataDeviceManager) {
       wl_data_device_manager_destroy(mDataDeviceManager);
@@ -958,6 +981,9 @@ DnDUIWayland::OnRegistryGlobal(struct wl_registry *reg,   // IN
       mLayerShell = static_cast<struct zwlr_layer_shell_v1 *>(
          wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
                           MIN(version, 3)));
+   } else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
+      mViewporter = static_cast<struct wp_viewporter *>(
+         wl_registry_bind(reg, name, &wp_viewporter_interface, 1));
    }
 }
 
@@ -1052,11 +1078,32 @@ DnDUIWayland::OnPointerButton(uint32 serial,   // IN
 }
 
 
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnLayerConfigure --
+ *
+ *      The compositor sized the detection surface, which is anchored to all
+ *      edges: that is the output's size. Stretch the 1x1 buffer to it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
 void
 DnDUIWayland::OnLayerConfigure(struct zwlr_layer_surface_v1 *ls,   // IN
-                               uint32 serial)                      // IN
+                               uint32 serial,                      // IN
+                               uint32 width,                       // IN
+                               uint32 height)                      // IN
 {
    zwlr_layer_surface_v1_ack_configure(ls, serial);
+   g_debug("%s: %ux%u\n", __FUNCTION__, width, height);
+   if (width > 0 && height > 0) {
+      wp_viewport_set_destination(mViewport, width, height);
+   }
+   /* The first configure is committed with the buffer in CreateDetWnd. */
+   if (mConfigured) {
+      wl_surface_commit(mSurface);
+   }
    mConfigured = true;
 }
 
@@ -1131,9 +1178,9 @@ DnDUIWayland::Flush()
  *
  * DnDUIWayland::CreateDetWnd --
  *
- *      Create the detection surface: an overlay-layer surface anchored to the
- *      top-left corner, positioned by its margins, with a fully transparent
- *      buffer and, while hidden, an empty input region.
+ *      Create the detection surface: a fully transparent overlay-layer
+ *      surface covering the output, with an empty input region until the
+ *      detection window is shown.
  *
  * Results:
  *      true on success.
@@ -1144,34 +1191,42 @@ DnDUIWayland::Flush()
 bool
 DnDUIWayland::CreateDetWnd()
 {
-   int stride = DET_WND_SIZE * 4;
-   int size = stride * DET_WND_SIZE;
    int fd = memfd_create("vmware-dnd-detwnd", MFD_CLOEXEC);
 
-   if (fd < 0 || ftruncate(fd, size) < 0) {
+   if (fd < 0 || ftruncate(fd, 4) < 0) {
       g_debug("%s: shm buffer failed: %s\n", __FUNCTION__, strerror(errno));
       if (fd >= 0) {
          close(fd);
       }
       return false;
    }
-   /* A new memfd reads as zeros: fully transparent ARGB. */
-   struct wl_shm_pool *pool = wl_shm_create_pool(mShm, fd, size);
-   mBuffer = wl_shm_pool_create_buffer(pool, 0, DET_WND_SIZE, DET_WND_SIZE,
-                                       stride, WL_SHM_FORMAT_ARGB8888);
+   /*
+    * One transparent pixel (a new memfd reads as zeros), stretched over the
+    * output by the viewport.
+    */
+   struct wl_shm_pool *pool = wl_shm_create_pool(mShm, fd, 4);
+   mBuffer = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4,
+                                       WL_SHM_FORMAT_ARGB8888);
    wl_shm_pool_destroy(pool);
    close(fd);
 
    mSurface = wl_compositor_create_surface(mCompositor);
+   mViewport = wp_viewporter_get_viewport(mViewporter, mSurface);
    mLayerSurface = zwlr_layer_shell_v1_get_layer_surface(
       mLayerShell, mSurface, mOutput, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
       "vmware-dnd-detection");
    zwlr_layer_surface_v1_add_listener(mLayerSurface, &sLayerListener, this);
-   zwlr_layer_surface_v1_set_size(mLayerSurface, DET_WND_SIZE, DET_WND_SIZE);
+   /* Size 0 along anchored edges: the compositor stretches it to fit. */
+   zwlr_layer_surface_v1_set_size(mLayerSurface, 0, 0);
    zwlr_layer_surface_v1_set_anchor(mLayerSurface,
                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-   /* Ignore panels' exclusive zones so margins are screen coordinates. */
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+   /*
+    * Ignore panels' exclusive zones, so the surface covers the whole output
+    * and surface coordinates are screen coordinates.
+    */
    zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
    zwlr_layer_surface_v1_set_keyboard_interactivity(mLayerSurface, 0);
    wl_surface_commit(mSurface);
@@ -1183,7 +1238,7 @@ DnDUIWayland::CreateDetWnd()
 
    HideDetWnd();
    wl_surface_attach(mSurface, mBuffer, 0, 0);
-   wl_surface_damage(mSurface, 0, 0, DET_WND_SIZE, DET_WND_SIZE);
+   wl_surface_damage(mSurface, 0, 0, INT32_MAX, INT32_MAX);
    wl_surface_commit(mSurface);
    wl_display_roundtrip(mDisplay);
    return true;
@@ -1195,8 +1250,8 @@ DnDUIWayland::CreateDetWnd()
  *
  * DnDUIWayland::ShowDetWnd --
  *
- *      Move the detection surface's top-left corner to (x, y) and let it
- *      take pointer input.
+ *      Show the detection window with its top-left corner at (x, y): make
+ *      that rectangle of the detection surface take pointer input.
  *
  *-----------------------------------------------------------------------------
  */
@@ -1210,16 +1265,21 @@ DnDUIWayland::ShowDetWnd(int32 x,   // IN
 
    g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y,
            DET_WND_SIZE, DET_WND_SIZE);
-   zwlr_layer_surface_v1_set_margin(mLayerSurface, y, 0, 0, x);
-   /* NULL is an infinite input region: the whole surface. */
-   wl_surface_set_input_region(mSurface, NULL);
+   struct wl_region *region = wl_compositor_create_region(mCompositor);
+   wl_region_add(region, x, y, DET_WND_SIZE, DET_WND_SIZE);
+   wl_surface_set_input_region(mSurface, region);
+   wl_region_destroy(region);
    wl_surface_commit(mSurface);
    mDetWndX = x;
    mDetWndY = y;
    mDetWndShown = true;
-   /* Make sure the move lands before any pointer events we fake next. */
+   /*
+    * Once the compositor has processed the commit, the new input region is
+    * in effect for any pointer events we fake next.
+    */
    wl_display_roundtrip(mDisplay);
 }
+
 
 
 void
@@ -1380,6 +1440,7 @@ DnDUIWayland::OnSrcDragBegin(const CPClipboard *clip,       // IN
     * the detection surface and wait for it to have pointer focus.
     */
    DestroySource();
+   mHoldingButton = false;
    FakeButton(false);
    ShowDetWnd(0, 0);
    mPressed = false;
@@ -1763,7 +1824,55 @@ DnDUIWayland::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
        */
       FakeMove(mDetWndX + 2, mDetWndY + 2);
    } else {
+      /*
+       * Let go of a held button while the detection window still covers the
+       * pointer, so a guest drag we didn't pick up ends on it (and is
+       * refused) rather than dropping on whatever is underneath.
+       */
+      ReleaseHeldButton();
       HideDetWnd();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnStateChanged --
+ *
+ *      When the host asks whether a guest drag is leaving the guest
+ *      (GUEST_DND_QUERY_EXITING, right after showing the detection window
+ *      under the pointer), hold the uinput button down.
+ *
+ *      The host releases the guest's button within milliseconds of asking,
+ *      which would drop a guest drag wherever it is before it can reach the
+ *      detection window. Compositors that pass on a button release only once
+ *      no device on the seat holds a button any more (KWin, via libinput's
+ *      seat button count) then keep the drag alive, so it can enter the
+ *      detection window. The press itself goes unseen if the drag's button
+ *      is still down, and otherwise lands on the detection window.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnStateChanged(GUEST_DND_STATE state)   // IN
+{
+   if (state == GUEST_DND_QUERY_EXITING && mDetWndShown && !mHoldingButton) {
+      g_debug("%s: holding the button for a guest drag\n", __FUNCTION__);
+      mHoldingButton = true;
+      FakeButton(true);
+   }
+}
+
+
+void
+DnDUIWayland::ReleaseHeldButton()
+{
+   if (mHoldingButton) {
+      mHoldingButton = false;
+      FakeMove(mDetWndX + DET_WND_SIZE / 2, mDetWndY + DET_WND_SIZE / 2);
+      FakeButton(false);
    }
 }
 
@@ -1825,8 +1934,13 @@ DnDUIWayland::OnPrivateDrop(int32 x,        // UNUSED
    TRACE_CALL();
 
    if (mGHDnDInProgress) {
-      FakeButton(false);
+      if (mHoldingButton) {
+         ReleaseHeldButton();
+      } else {
+         FakeButton(false);
+      }
    }
+   ReleaseHeldButton();
    ResetUI();
 }
 
@@ -1858,10 +1972,15 @@ DnDUIWayland::OnDestCancel()
 
    if (mGHDnDInProgress) {
       ShowDetWnd(mDetWndX, mDetWndY);
-      FakeMove(mDetWndX + DET_WND_SIZE / 2, mDetWndY + DET_WND_SIZE / 2);
-      FakeButton(true);
-      FakeButton(false);
+      if (mHoldingButton) {
+         ReleaseHeldButton();
+      } else {
+         FakeMove(mDetWndX + DET_WND_SIZE / 2, mDetWndY + DET_WND_SIZE / 2);
+         FakeButton(true);
+         FakeButton(false);
+      }
    }
+   ReleaseHeldButton();
    mDestDropTime = GetTimeInMillis();
    ResetUI();
 }
