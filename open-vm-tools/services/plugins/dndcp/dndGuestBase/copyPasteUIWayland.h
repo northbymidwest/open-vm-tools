@@ -24,12 +24,13 @@
  *    CopyPasteUIX11 uses the X11 clipboard through Xwayland on a Wayland
  *    session, which depends on the compositor syncing the Wayland clipboard
  *    to X11. KWin only does that while an X11 window has focus, which
- *    vmware-user never has, so guest-to-host copy fails. This class uses the
- *    ext-data-control-v1 protocol instead, which lets a client without any
- *    window read and set the clipboard.
+ *    vmware-user never has, so guest-to-host copy fails. This class uses a
+ *    data control protocol instead, which lets a client without any window
+ *    read and set the clipboard: ext-data-control-v1, or its predecessor
+ *    wlr-data-control-unstable-v1.
  *
- *    It needs the compositor to offer ext_data_control_manager_v1, so it is
- *    only used when IsSupported() says so; otherwise CopyPasteUIX11 is used.
+ *    It needs the compositor to offer one of the two, so it is only used when
+ *    IsSupported() says so; otherwise CopyPasteUIX11 is used.
  */
 
 #ifndef __COPYPASTE_UI_WAYLAND_H__
@@ -58,10 +59,6 @@ extern "C" {
 struct wl_display;
 struct wl_registry;
 struct wl_seat;
-struct ext_data_control_manager_v1;
-struct ext_data_control_device_v1;
-struct ext_data_control_source_v1;
-struct ext_data_control_offer_v1;
 
 class CopyPasteUIWayland
    : public CopyPasteUI,
@@ -84,19 +81,28 @@ public:
     */
    void OnRegistryGlobal(struct wl_registry *reg, uint32 name,
                          const char *iface, uint32 version);
-   void OnDataOffer(struct ext_data_control_offer_v1 *offer);
-   void OnOfferMimeType(struct ext_data_control_offer_v1 *offer,
-                        const char *mimeType);
-   void OnSelection(struct ext_data_control_offer_v1 *offer);
-   void OnPrimarySelection(struct ext_data_control_offer_v1 *offer);
+   void OnDataOffer(void *offer);
+   void OnOfferMimeType(void *offer, const char *mimeType);
+   void OnSelection(void *offer);
+   void OnPrimarySelection(void *offer);
    void OnDeviceFinished();
-   void OnSourceSend(struct ext_data_control_source_v1 *source,
-                     const char *mimeType, int32 fd);
-   void OnSourceCancelled(struct ext_data_control_source_v1 *source);
+   void OnSourceSend(void *source, const char *mimeType, int32 fd);
+   void OnSourceCancelled(void *source);
 
 private:
    bool Connect();
    void Disconnect();
+
+   /*
+    * Data control requests, on ext-data-control-v1 or
+    * wlr-data-control-unstable-v1 objects as mWlr says.
+    */
+   void DataControlGetDevice();
+   void DataControlDestroyDevice();
+   void *DataControlCreateSource(const std::vector<std::string> &mimeTypes);
+   void DataControlSourceDestroy(void *source);
+   void DataControlOfferReceive(void *offer, const char *mimeType, int fd);
+   void DataControlOfferDestroy(void *offer);
 
    /* hg */
    void GetRemoteClipboardCB(const CPClipboard *clip);
@@ -136,8 +142,13 @@ private:
    struct wl_display *mDisplay;
    struct wl_registry *mRegistry;
    struct wl_seat *mSeat;
-   struct ext_data_control_manager_v1 *mManager;
-   struct ext_data_control_device_v1 *mDevice;
+   /*
+    * Data control objects: ext_data_control_*_v1, or zwlr_data_control_*_v1
+    * when mWlr is set (the compositor lacks ext-data-control-v1).
+    */
+   void *mManager;
+   void *mDevice;
+   bool mWlr;
    GSource *mSource;
    WaylandTransfers mTransfers;
 
@@ -145,15 +156,15 @@ private:
     * The current selection. An offer and its MIME types arrive before the
     * selection (or primary_selection) event that says what it is for.
     */
-   struct ext_data_control_offer_v1 *mPendingOffer;
+   void *mPendingOffer;
    std::vector<std::string> mPendingOfferMimeTypes;
-   struct ext_data_control_offer_v1 *mSelection;
+   void *mSelection;
    std::vector<std::string> mSelectionMimeTypes;
    /* Bumped whenever another client sets the selection. */
    uint64 mSelectionSerial;
 
    /* hg: we own the selection with the host's clipboard. */
-   struct ext_data_control_source_v1 *mDataSource;
+   void *mDataSource;
    bool mIsClipboardOwner;
    std::string mHGTextData;
    std::string mHGRTFData;

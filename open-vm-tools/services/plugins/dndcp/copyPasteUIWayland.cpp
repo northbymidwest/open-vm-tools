@@ -20,11 +20,14 @@
  * @file copyPasteUIWayland.cpp --
  *
  *    Native Wayland copy/paste UI. Mirrors CopyPasteUIX11's handling of the
- *    common copy/paste layer's signals, using ext-data-control-v1 in place
- *    of the X11 clipboard:
+ *    common copy/paste layer's signals, using a data control protocol in
+ *    place of the X11 clipboard: ext-data-control-v1, or its predecessor
+ *    wlr-data-control-unstable-v1 where a compositor only has that. The two
+ *    have the same requests and events; DataControl* below picks the one in
+ *    use.
  *
  *    - Host-to-guest: the host's clipboard becomes an
- *      ext_data_control_source_v1 set as the selection. Copied files are
+ *      data control source set as the selection. Copied files are
  *      offered as paths in a vmblock-blocked staging directory, and the
  *      transfer from the host starts when one of them is first accessed.
  *
@@ -48,6 +51,7 @@
 #include <wayland-client.h>
 
 #include "ext-data-control-v1-client-protocol.h"
+#include "wlr-data-control-unstable-v1-client-protocol.h"
 
 #include "copyPasteUIWayland.h"
 #include "guestDnDCPMgr.hh"
@@ -88,57 +92,86 @@ RegistryGlobalRemove(void *data, struct wl_registry *reg, uint32_t name)
 {
 }
 
+/*
+ * Data control events. The ext and wlr protocols' listeners differ only in
+ * their argument types, so each trampoline is a template instantiated for
+ * both.
+ */
+
+template <typename Device, typename Offer>
 static void
-DeviceDataOffer(void *data, struct ext_data_control_device_v1 *d,
-                struct ext_data_control_offer_v1 *offer)
+DeviceDataOffer(void *data, Device *d, Offer *offer)
 {
    UI(data)->OnDataOffer(offer);
 }
 
+template <typename Device, typename Offer>
 static void
-DeviceSelection(void *data, struct ext_data_control_device_v1 *d,
-                struct ext_data_control_offer_v1 *offer)
+DeviceSelection(void *data, Device *d, Offer *offer)
 {
    UI(data)->OnSelection(offer);
 }
 
+template <typename Device>
 static void
-DeviceFinished(void *data, struct ext_data_control_device_v1 *d)
+DeviceFinished(void *data, Device *d)
 {
    UI(data)->OnDeviceFinished();
 }
 
+template <typename Device, typename Offer>
 static void
-DevicePrimarySelection(void *data, struct ext_data_control_device_v1 *d,
-                       struct ext_data_control_offer_v1 *offer)
+DevicePrimarySelection(void *data, Device *d, Offer *offer)
 {
    UI(data)->OnPrimarySelection(offer);
 }
 
+template <typename Offer>
 static void
-OfferOffer(void *data, struct ext_data_control_offer_v1 *offer,
-           const char *mimeType)
+OfferOffer(void *data, Offer *offer, const char *mimeType)
 {
    UI(data)->OnOfferMimeType(offer, mimeType);
 }
 
+template <typename Source>
 static void
-SourceSend(void *data, struct ext_data_control_source_v1 *source,
-           const char *mimeType, int32_t fd)
+SourceSend(void *data, Source *source, const char *mimeType, int32_t fd)
 {
    UI(data)->OnSourceSend(source, mimeType, fd);
 }
 
+template <typename Source>
 static void
-SourceCancelled(void *data, struct ext_data_control_source_v1 *source)
+SourceCancelled(void *data, Source *source)
 {
    UI(data)->OnSourceCancelled(source);
 }
 
 static struct wl_registry_listener sRegistryListener;
-static struct ext_data_control_device_v1_listener sDeviceListener;
-static struct ext_data_control_offer_v1_listener sOfferListener;
-static struct ext_data_control_source_v1_listener sSourceListener;
+static struct ext_data_control_device_v1_listener sExtDeviceListener;
+static struct ext_data_control_offer_v1_listener sExtOfferListener;
+static struct ext_data_control_source_v1_listener sExtSourceListener;
+static struct zwlr_data_control_device_v1_listener sWlrDeviceListener;
+static struct zwlr_data_control_offer_v1_listener sWlrOfferListener;
+static struct zwlr_data_control_source_v1_listener sWlrSourceListener;
+
+
+template <typename DeviceListener, typename OfferListener,
+          typename SourceListener, typename Device, typename Offer,
+          typename Source>
+static void
+InitDataControlListeners(DeviceListener &device,   // OUT
+                         OfferListener &offer,     // OUT
+                         SourceListener &source)   // OUT
+{
+   device.data_offer = DeviceDataOffer<Device, Offer>;
+   device.selection = DeviceSelection<Device, Offer>;
+   device.finished = DeviceFinished<Device>;
+   device.primary_selection = DevicePrimarySelection<Device, Offer>;
+   offer.offer = OfferOffer<Offer>;
+   source.send = SourceSend<Source>;
+   source.cancelled = SourceCancelled<Source>;
+}
 
 
 static void
@@ -154,15 +187,20 @@ InitListeners()
    sRegistryListener.global = RegistryGlobal;
    sRegistryListener.global_remove = RegistryGlobalRemove;
 
-   sDeviceListener.data_offer = DeviceDataOffer;
-   sDeviceListener.selection = DeviceSelection;
-   sDeviceListener.finished = DeviceFinished;
-   sDeviceListener.primary_selection = DevicePrimarySelection;
-
-   sOfferListener.offer = OfferOffer;
-
-   sSourceListener.send = SourceSend;
-   sSourceListener.cancelled = SourceCancelled;
+   InitDataControlListeners<ext_data_control_device_v1_listener,
+                            ext_data_control_offer_v1_listener,
+                            ext_data_control_source_v1_listener,
+                            struct ext_data_control_device_v1,
+                            struct ext_data_control_offer_v1,
+                            struct ext_data_control_source_v1>(
+      sExtDeviceListener, sExtOfferListener, sExtSourceListener);
+   InitDataControlListeners<zwlr_data_control_device_v1_listener,
+                            zwlr_data_control_offer_v1_listener,
+                            zwlr_data_control_source_v1_listener,
+                            struct zwlr_data_control_device_v1,
+                            struct zwlr_data_control_offer_v1,
+                            struct zwlr_data_control_source_v1>(
+      sWlrDeviceListener, sWlrOfferListener, sWlrSourceListener);
 }
 
 
@@ -184,6 +222,7 @@ CopyPasteUIWayland::CopyPasteUIWayland()
      mRegistry(NULL),
      mSeat(NULL),
      mManager(NULL),
+     mWlr(false),
      mDevice(NULL),
      mSource(NULL),
      mPendingOffer(NULL),
@@ -272,8 +311,8 @@ CopyPasteUIWayland::~CopyPasteUIWayland()
  * CopyPasteUIWayland::IsSupported --
  *
  *      Whether vmusr runs in a Wayland session whose compositor offers
- *      ext-data-control-v1. VMTOOLS_CP_BACKEND=x11 or =wayland forces a
- *      choice.
+ *      ext-data-control-v1 or wlr-data-control-unstable-v1.
+ *      VMTOOLS_CP_BACKEND=x11 or =wayland forces a choice.
  *
  *-----------------------------------------------------------------------------
  */
@@ -295,7 +334,8 @@ CopyPasteUIWayland::IsSupported()
    static struct wl_registry_listener probe;
    probe.global = [](void *data, struct wl_registry *reg, uint32_t name,
                      const char *iface, uint32_t version) {
-      if (strcmp(iface, ext_data_control_manager_v1_interface.name) == 0) {
+      if (   strcmp(iface, ext_data_control_manager_v1_interface.name) == 0
+          || strcmp(iface, zwlr_data_control_manager_v1_interface.name) == 0) {
          *static_cast<bool *>(data) = true;
       }
    };
@@ -307,7 +347,7 @@ CopyPasteUIWayland::IsSupported()
    wl_registry_destroy(reg);
    wl_display_disconnect(display);
 
-   g_debug("%s: ext-data-control %d\n", __FUNCTION__, found);
+   g_debug("%s: data control %d\n", __FUNCTION__, found);
    return found;
 }
 
@@ -391,8 +431,9 @@ CopyPasteUIWayland::Connect()
       return false;
    }
 
-   mDevice = ext_data_control_manager_v1_get_data_device(mManager, mSeat);
-   ext_data_control_device_v1_add_listener(mDevice, &sDeviceListener, this);
+   g_debug("%s: using %s\n", __FUNCTION__,
+           mWlr ? "wlr-data-control-unstable-v1" : "ext-data-control-v1");
+   DataControlGetDevice();
    /* The device sends the current selection right away. */
    wl_display_roundtrip(mDisplay);
 
@@ -406,11 +447,11 @@ CopyPasteUIWayland::Disconnect()
 {
    DestroySource();
    if (mSelection) {
-      ext_data_control_offer_v1_destroy(mSelection);
+      DataControlOfferDestroy(mSelection);
       mSelection = NULL;
    }
    if (mPendingOffer) {
-      ext_data_control_offer_v1_destroy(mPendingOffer);
+      DataControlOfferDestroy(mPendingOffer);
       mPendingOffer = NULL;
    }
    if (mSource) {
@@ -418,12 +459,15 @@ CopyPasteUIWayland::Disconnect()
       g_source_unref(mSource);
       mSource = NULL;
    }
-   if (mDevice) {
-      ext_data_control_device_v1_destroy(mDevice);
-      mDevice = NULL;
-   }
+   DataControlDestroyDevice();
    if (mManager) {
-      ext_data_control_manager_v1_destroy(mManager);
+      if (mWlr) {
+         zwlr_data_control_manager_v1_destroy(
+            static_cast<struct zwlr_data_control_manager_v1 *>(mManager));
+      } else {
+         ext_data_control_manager_v1_destroy(
+            static_cast<struct ext_data_control_manager_v1 *>(mManager));
+      }
       mManager = NULL;
    }
    if (mSeat) {
@@ -451,11 +495,162 @@ CopyPasteUIWayland::OnRegistryGlobal(struct wl_registry *reg,   // IN
       mSeat = static_cast<struct wl_seat *>(
          wl_registry_bind(reg, name, &wl_seat_interface, 1));
    } else if (strcmp(iface, ext_data_control_manager_v1_interface.name) == 0) {
-      mManager = static_cast<struct ext_data_control_manager_v1 *>(
-         wl_registry_bind(reg, name, &ext_data_control_manager_v1_interface,
-                          1));
+      /* Preferred: replaces any wlr manager bound first. */
+      if (mManager != NULL && mWlr) {
+         zwlr_data_control_manager_v1_destroy(
+            static_cast<struct zwlr_data_control_manager_v1 *>(mManager));
+      }
+      if (mManager == NULL || mWlr) {
+         mManager = wl_registry_bind(reg, name,
+                                     &ext_data_control_manager_v1_interface, 1);
+         mWlr = false;
+      }
+   } else if (   strcmp(iface, zwlr_data_control_manager_v1_interface.name) == 0
+              && mManager == NULL) {
+      /* Version 2 adds the primary selection events. */
+      mManager = wl_registry_bind(reg, name,
+                                  &zwlr_data_control_manager_v1_interface,
+                                  MIN(version, 2));
+      mWlr = true;
    }
 }
+
+
+/*
+ ****************************************************************************
+ * BEGIN data control protocol wrappers
+ *
+ *      Requests on the ext-data-control-v1 or wlr-data-control-unstable-v1
+ *      objects behind the opaque handles, whichever mWlr says is in use.
+ */
+
+
+void
+CopyPasteUIWayland::DataControlGetDevice()
+{
+   if (mWlr) {
+      struct zwlr_data_control_device_v1 *device =
+         zwlr_data_control_manager_v1_get_data_device(
+            static_cast<struct zwlr_data_control_manager_v1 *>(mManager),
+            mSeat);
+      zwlr_data_control_device_v1_add_listener(device, &sWlrDeviceListener,
+                                               this);
+      mDevice = device;
+   } else {
+      struct ext_data_control_device_v1 *device =
+         ext_data_control_manager_v1_get_data_device(
+            static_cast<struct ext_data_control_manager_v1 *>(mManager),
+            mSeat);
+      ext_data_control_device_v1_add_listener(device, &sExtDeviceListener,
+                                              this);
+      mDevice = device;
+   }
+}
+
+
+void
+CopyPasteUIWayland::DataControlDestroyDevice()
+{
+   if (mDevice == NULL) {
+      return;
+   }
+   if (mWlr) {
+      zwlr_data_control_device_v1_destroy(
+         static_cast<struct zwlr_data_control_device_v1 *>(mDevice));
+   } else {
+      ext_data_control_device_v1_destroy(
+         static_cast<struct ext_data_control_device_v1 *>(mDevice));
+   }
+   mDevice = NULL;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::DataControlCreateSource --
+ *
+ *      Create a source offering mimeTypes and make it the selection.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void *
+CopyPasteUIWayland::DataControlCreateSource(
+   const std::vector<std::string> &mimeTypes)   // IN
+{
+   if (mWlr) {
+      struct zwlr_data_control_source_v1 *source =
+         zwlr_data_control_manager_v1_create_data_source(
+            static_cast<struct zwlr_data_control_manager_v1 *>(mManager));
+      zwlr_data_control_source_v1_add_listener(source, &sWlrSourceListener,
+                                               this);
+      for (size_t i = 0; i < mimeTypes.size(); i++) {
+         zwlr_data_control_source_v1_offer(source, mimeTypes[i].c_str());
+      }
+      zwlr_data_control_device_v1_set_selection(
+         static_cast<struct zwlr_data_control_device_v1 *>(mDevice), source);
+      return source;
+   }
+
+   struct ext_data_control_source_v1 *source =
+      ext_data_control_manager_v1_create_data_source(
+         static_cast<struct ext_data_control_manager_v1 *>(mManager));
+   ext_data_control_source_v1_add_listener(source, &sExtSourceListener, this);
+   for (size_t i = 0; i < mimeTypes.size(); i++) {
+      ext_data_control_source_v1_offer(source, mimeTypes[i].c_str());
+   }
+   ext_data_control_device_v1_set_selection(
+      static_cast<struct ext_data_control_device_v1 *>(mDevice), source);
+   return source;
+}
+
+
+void
+CopyPasteUIWayland::DataControlSourceDestroy(void *source)   // IN
+{
+   if (mWlr) {
+      zwlr_data_control_source_v1_destroy(
+         static_cast<struct zwlr_data_control_source_v1 *>(source));
+   } else {
+      ext_data_control_source_v1_destroy(
+         static_cast<struct ext_data_control_source_v1 *>(source));
+   }
+}
+
+
+void
+CopyPasteUIWayland::DataControlOfferReceive(void *offer,            // IN
+                                            const char *mimeType,   // IN
+                                            int fd)                 // IN
+{
+   if (mWlr) {
+      zwlr_data_control_offer_v1_receive(
+         static_cast<struct zwlr_data_control_offer_v1 *>(offer), mimeType, fd);
+   } else {
+      ext_data_control_offer_v1_receive(
+         static_cast<struct ext_data_control_offer_v1 *>(offer), mimeType, fd);
+   }
+}
+
+
+void
+CopyPasteUIWayland::DataControlOfferDestroy(void *offer)   // IN
+{
+   if (mWlr) {
+      zwlr_data_control_offer_v1_destroy(
+         static_cast<struct zwlr_data_control_offer_v1 *>(offer));
+   } else {
+      ext_data_control_offer_v1_destroy(
+         static_cast<struct ext_data_control_offer_v1 *>(offer));
+   }
+}
+
+
+/*
+ * END data control protocol wrappers
+ ****************************************************************************
+ */
 
 
 /*
@@ -465,20 +660,28 @@ CopyPasteUIWayland::OnRegistryGlobal(struct wl_registry *reg,   // IN
 
 
 void
-CopyPasteUIWayland::OnDataOffer(struct ext_data_control_offer_v1 *offer) // IN
+CopyPasteUIWayland::OnDataOffer(void *offer) // IN
 {
    /* Introduces the offer of the next selection or primary_selection. */
    if (mPendingOffer) {
-      ext_data_control_offer_v1_destroy(mPendingOffer);
+      DataControlOfferDestroy(mPendingOffer);
    }
    mPendingOffer = offer;
    mPendingOfferMimeTypes.clear();
-   ext_data_control_offer_v1_add_listener(offer, &sOfferListener, this);
+   if (mWlr) {
+      zwlr_data_control_offer_v1_add_listener(
+         static_cast<struct zwlr_data_control_offer_v1 *>(offer),
+         &sWlrOfferListener, this);
+   } else {
+      ext_data_control_offer_v1_add_listener(
+         static_cast<struct ext_data_control_offer_v1 *>(offer),
+         &sExtOfferListener, this);
+   }
 }
 
 
 void
-CopyPasteUIWayland::OnOfferMimeType(struct ext_data_control_offer_v1 *offer, // IN
+CopyPasteUIWayland::OnOfferMimeType(void *offer,              // IN
                                     const char *mimeType)                    // IN
 {
    if (offer == mPendingOffer) {
@@ -500,10 +703,10 @@ CopyPasteUIWayland::OnOfferMimeType(struct ext_data_control_offer_v1 *offer, // 
  */
 
 void
-CopyPasteUIWayland::OnSelection(struct ext_data_control_offer_v1 *offer) // IN
+CopyPasteUIWayland::OnSelection(void *offer) // IN
 {
    if (mSelection) {
-      ext_data_control_offer_v1_destroy(mSelection);
+      DataControlOfferDestroy(mSelection);
       mSelection = NULL;
    }
    mSelectionMimeTypes.clear();
@@ -530,7 +733,7 @@ CopyPasteUIWayland::OnSelection(struct ext_data_control_offer_v1 *offer) // IN
 
 
 void
-CopyPasteUIWayland::OnPrimarySelection(struct ext_data_control_offer_v1 *offer) // IN
+CopyPasteUIWayland::OnPrimarySelection(void *offer) // IN
 {
    /*
     * Like the host-facing clipboard in Windows and macOS, only the regular
@@ -543,7 +746,7 @@ CopyPasteUIWayland::OnPrimarySelection(struct ext_data_control_offer_v1 *offer) 
       mPendingOffer = NULL;
       mPendingOfferMimeTypes.clear();
    }
-   ext_data_control_offer_v1_destroy(offer);
+   DataControlOfferDestroy(offer);
 }
 
 
@@ -555,8 +758,7 @@ CopyPasteUIWayland::OnDeviceFinished()
     * working until vmusr resets the plugin.
     */
    g_warning("%s: data control device finished\n", __FUNCTION__);
-   ext_data_control_device_v1_destroy(mDevice);
-   mDevice = NULL;
+   DataControlDestroyDevice();
 }
 
 
@@ -675,14 +877,9 @@ CopyPasteUIWayland::SetSelection(const std::vector<std::string> &mimeTypes) // I
       return;
    }
 
-   mDataSource = ext_data_control_manager_v1_create_data_source(mManager);
-   ext_data_control_source_v1_add_listener(mDataSource, &sSourceListener,
-                                           this);
-   for (size_t i = 0; i < mimeTypes.size(); i++) {
-      ext_data_control_source_v1_offer(mDataSource, mimeTypes[i].c_str());
-   }
-   ext_data_control_source_v1_offer(mDataSource, OwnerMimeType().c_str());
-   ext_data_control_device_v1_set_selection(mDevice, mDataSource);
+   std::vector<std::string> offered = mimeTypes;
+   offered.push_back(OwnerMimeType());
+   mDataSource = DataControlCreateSource(offered);
    wl_display_flush(mDisplay);
    mIsClipboardOwner = true;
 }
@@ -692,7 +889,7 @@ void
 CopyPasteUIWayland::DestroySource()
 {
    if (mDataSource) {
-      ext_data_control_source_v1_destroy(mDataSource);
+      DataControlSourceDestroy(mDataSource);
       mDataSource = NULL;
    }
    mIsClipboardOwner = false;
@@ -700,14 +897,14 @@ CopyPasteUIWayland::DestroySource()
 
 
 void
-CopyPasteUIWayland::OnSourceCancelled(struct ext_data_control_source_v1 *source) // IN
+CopyPasteUIWayland::OnSourceCancelled(void *source) // IN
 {
    /* Another client took the clipboard. A file transfer carries on. */
    g_debug("%s: no longer the clipboard owner\n", __FUNCTION__);
    if (source == mDataSource) {
       DestroySource();
    } else {
-      ext_data_control_source_v1_destroy(source);
+      DataControlSourceDestroy(source);
    }
 }
 
@@ -727,7 +924,7 @@ CopyPasteUIWayland::OnSourceCancelled(struct ext_data_control_source_v1 *source)
  */
 
 void
-CopyPasteUIWayland::OnSourceSend(struct ext_data_control_source_v1 *source, // IN
+CopyPasteUIWayland::OnSourceSend(void *source,                // IN
                                  const char *mimeType,                      // IN
                                  int32 fd)                                  // IN
 {
@@ -1161,7 +1358,7 @@ CopyPasteUIWayland::GetLocalClipboard()
          g_debug("%s: pipe failed: %s\n", __FUNCTION__, strerror(errno));
          continue;
       }
-      ext_data_control_offer_v1_receive(mSelection, wanted[i].c_str(), fds[1]);
+      DataControlOfferReceive(mSelection, wanted[i].c_str(), fds[1]);
       close(fds[1]);
       mTransfers.Read(fds[0],
                       sigc::bind(sigc::mem_fun(this,
