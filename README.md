@@ -67,24 +67,73 @@ autoreconf -i
 make
 ```
 
-On NixOS, the nixpkgs package can be overridden to build this branch, with
-`src` pointing at a checkout of it:
+## NixOS
+
+The branch is a flake. Its NixOS module, used together with NixOS's own
+`virtualisation.vmware.guest`, does everything needed:
+
+- builds your nixpkgs' `open-vm-tools` from this branch, with the Wayland
+  backends, as `virtualisation.vmware.guest.package`;
+- turns the desktop parts on (`headless = false`): NixOS only does that when
+  `services.xserver` is enabled, which Wayland-only desktops don't need;
+- starts `vmware-user` through the setuid wrapper from an XDG autostart entry:
+  NixOS only starts it from X11 session commands, which Wayland sessions
+  don't run.
+
+Each of these is only a default, so any of them can still be overridden.
+
+Add the flake to your system flake and import the module:
 
 ```nix
-virtualisation.vmware.guest.package = pkgs.open-vm-tools.overrideAttrs (old: {
-  src = open-vm-tools-wayland;  # e.g. a flake input for this branch
-  sourceRoot = "source/open-vm-tools";
-  nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.wayland-scanner ];
-  buildInputs = old.buildInputs ++ [ pkgs.wayland ];
-  configureFlags = old.configureFlags ++ [ "--with-wayland" ];
-});
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    open-vm-tools-wayland = {
+      url = "github:northbymidwest/open-vm-tools/wayland-dnd";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs =
+    { nixpkgs, open-vm-tools-wayland, ... }:
+    {
+      nixosConfigurations.my-vm = nixpkgs.lib.nixosSystem {
+        system = "aarch64-linux"; # or "x86_64-linux"
+        modules = [
+          ./configuration.nix
+          open-vm-tools-wayland.nixosModules.default
+          { virtualisation.vmware.guest.enable = true; }
+        ];
+      };
+    };
+}
 ```
+
+Then rebuild, and log out and back in so `vmware-user` starts in the new
+session:
+
+```sh
+sudo nixos-rebuild switch --flake .#my-vm
+```
+
+To check that it is running, with access to vmblock and uinput:
+
+```sh
+pgrep -af 'vmtoolsd -n vmusr'
+# .../open-vm-tools-13.1.0-wayland-dnd/bin/vmtoolsd -n vmusr --blockFd 3 --uinputFd 4
+```
+
+The flake also provides the package itself (`packages.<system>.default`, e.g.
+`nix build github:northbymidwest/open-vm-tools/wayland-dnd`) and an overlay
+(`overlays.default`) that replaces `open-vm-tools`, for setups that don't use
+the module.
 
 ## Using it
 
-`vmware-user` (`vmtoolsd -n vmusr`) has to be started inside the Wayland
-session, as usual through `vmware-user-suid-wrapper`, e.g. from an XDG
-autostart entry. Nothing else changes: the plugin picks the Wayland backends
+Outside NixOS, `vmware-user` (`vmtoolsd -n vmusr`) has to be started inside
+the Wayland session through `vmware-user-suid-wrapper`, e.g. from an XDG
+autostart entry; the NixOS module above does this for you. Nothing else
+changes: the plugin picks the Wayland backends
 on its own when the session is Wayland (`XDG_SESSION_TYPE=wayland`) and the
 compositor has the protocols above.
 
