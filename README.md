@@ -1,3 +1,106 @@
+# The `wayland-dnd` branch: native Wayland drag and drop and copy/paste
+
+This branch adds native Wayland backends to `vmware-user`'s `dndcp` plugin.
+Upstream, drag and drop and copy/paste on a Wayland session go through
+Xwayland, which depends on the compositor carrying drags and the clipboard
+between X11 and Wayland clients. KDE Plasma's KWin doesn't do that for
+`vmware-user`: dropping files dragged in from the host never completes, and
+copying from the guest to the host does nothing.
+
+With this branch, `vmware-user` talks to the compositor directly where the
+compositor supports it, and falls back to the existing X11 code everywhere
+else.
+
+## Compositor requirements
+
+Each feature picks its backend at startup, independently:
+
+| Feature | Wayland protocols needed | Otherwise |
+|---|---|---|
+| Drag and drop | `zwlr_layer_shell_v1`, `wl_data_device_manager` version 3, `wp_viewporter` | X11 (`DnDUIX11`) |
+| Copy/paste | `ext_data_control_manager_v1` | X11 (`CopyPasteUIX11`) |
+
+Drag and drop also needs the uinput file descriptor that
+`vmware-user-suid-wrapper` passes as `--uinputFd`. Both features want the
+`vmblock-fuse` mount, as upstream does, so that file transfers block readers
+until the files have arrived.
+
+To see what a compositor offers, run `wayland-info` (from wayland-utils) in
+the session:
+
+```sh
+wayland-info | grep -E 'layer_shell|data_device_manager|viewporter|data_control'
+```
+
+Tested with VMware Fusion on an Apple silicon Mac and a NixOS guest:
+
+| Session | Drag and drop | Copy/paste |
+|---|---|---|
+| KDE Plasma 6 (KWin) | native Wayland | native Wayland |
+| Sway (wlroots) | native Wayland | native Wayland |
+| GNOME (Mutter) | X11 fallback | X11 fallback |
+
+Mutter offers neither layer-shell nor `ext-data-control`, but its Xwayland
+bridge handles the X11 path fine. Compositors that only offer the older
+`zwlr_data_control_manager_v1` also fall back to X11 for copy/paste.
+
+## Known limitation: dragging out of the guest
+
+Dragging from the guest to the host is unreliable with either backend, X11
+included. When the pointer leaves the VM window, the host releases the
+guest's mouse button right away, but its `DND_CMD_QUERY_EXITING` message
+reaches `vmware-user` through the polled RPC channel, which backs off to 100ms
+when idle. The guest drag is usually dropped before `vmware-user` hears about
+it. Copying and pasting files works in both directions.
+
+## Building
+
+The Wayland backends are built by default when `wayland-client` and
+`wayland-scanner` are found. The protocol XML they use is included in
+`open-vm-tools/services/plugins/dndcp/wayland`. Pass `--with-wayland` to
+`configure` to make them required, or `--without-wayland` to leave them out:
+
+```sh
+cd open-vm-tools
+autoreconf -i
+./configure --with-wayland
+make
+```
+
+On NixOS, the nixpkgs package can be overridden to build this branch, with
+`src` pointing at a checkout of it:
+
+```nix
+virtualisation.vmware.guest.package = pkgs.open-vm-tools.overrideAttrs (old: {
+  src = open-vm-tools-wayland;  # e.g. a flake input for this branch
+  sourceRoot = "source/open-vm-tools";
+  nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.wayland-scanner ];
+  buildInputs = old.buildInputs ++ [ pkgs.wayland ];
+  configureFlags = old.configureFlags ++ [ "--with-wayland" ];
+});
+```
+
+## Using it
+
+`vmware-user` (`vmtoolsd -n vmusr`) has to be started inside the Wayland
+session, as usual through `vmware-user-suid-wrapper`, e.g. from an XDG
+autostart entry. Nothing else changes: the plugin picks the Wayland backends
+on its own when the session is Wayland (`XDG_SESSION_TYPE=wayland`) and the
+compositor has the protocols above.
+
+To override that choice, set these in `vmware-user`'s environment:
+
+- `VMTOOLS_DND_BACKEND=x11` or `=wayland` for drag and drop
+- `VMTOOLS_CP_BACKEND=x11` or `=wayland` for copy/paste
+
+`wayland` still falls back to X11 if the compositor lacks a required protocol.
+
+With debug logging for `vmusr` enabled in `tools.conf`, the log says which
+backend was chosen: look for `native Wayland DnD` and
+`native Wayland copy/paste`.
+
+---
+
 # General
 ## What is the open-vm-tools project?
 open-vm-tools is a set of services and modules that enable several features in VMware products for better management of, and seamless user interactions with, guests. It includes kernel modules for enhancing the performance of virtual machines running Linux or other VMware supported Unix like guest operating systems. 
