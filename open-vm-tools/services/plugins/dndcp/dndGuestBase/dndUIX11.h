@@ -48,6 +48,7 @@ extern "C" {
 
 #include "guestDnD.hh"
 #include "dndFileList.hh"
+#include "dndUI.h"
 #include "dragDetWndX11.h"
 
 struct DblLnkLst_Links;
@@ -57,7 +58,8 @@ struct DblLnkLst_Links;
  * versions of the protocol.
  */
 class DnDUIX11
-   : public sigc::trackable
+   : public DnDUI,
+     public sigc::trackable
 {
 public:
    DnDUIX11(ToolsAppCtx *ctx);

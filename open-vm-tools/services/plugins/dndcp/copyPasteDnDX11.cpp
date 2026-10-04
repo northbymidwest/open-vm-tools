@@ -27,6 +27,9 @@
 
 #include "copyPasteDnDWrapper.h"
 #include "copyPasteDnDX11.h"
+#ifdef HAVE_WAYLAND_DND
+#include "dndUIWayland.h"
+#endif
 #include "copyPasteUIX11.h"
 #include "tracer.hh"
 #include "dndPluginIntX11.h"
@@ -369,21 +372,41 @@ CopyPasteDnDX11::RegisterDnD()
    }
 
    if (!wrapper->IsDnDRegistered()) {
-      m_dndUI = new DnDUIX11(wrapper->GetToolsAppCtx());
-      if (m_dndUI) {
-         BlockService *bs = BlockService::GetInstance();
+      BlockService *bs = BlockService::GetInstance();
+
+#ifdef HAVE_WAYLAND_DND
+      /*
+       * Prefer native Wayland DnD where the compositor supports it; X11 DnD
+       * through Xwayland relies on the compositor's X11/Wayland drag bridge.
+       */
+      if (DnDUIWayland::IsSupported()) {
+         m_dndUI = new DnDUIWayland(wrapper->GetToolsAppCtx());
          m_dndUI->SetBlockControl(bs->GetBlockCtrl());
-         if (m_dndUI->Init()) {
-            wrapper->SetDnDIsRegistered(TRUE);
-            m_dndUI->SetDnDAllowed(TRUE);
-            int version = wrapper->GetDnDVersion();
-            g_debug("%s: dnd version is %d\n", __FUNCTION__, version);
-            if (version >= 3) {
-               DnDVersionChanged(version);
-            }
-         } else {
+         if (!m_dndUI->Init()) {
+            g_debug("%s: native Wayland DnD unavailable, using X11\n",
+                    __FUNCTION__);
             delete m_dndUI;
             m_dndUI = nullptr;
+         }
+      }
+      if (!m_dndUI)
+#endif
+      {
+         m_dndUI = new DnDUIX11(wrapper->GetToolsAppCtx());
+         m_dndUI->SetBlockControl(bs->GetBlockCtrl());
+         if (!m_dndUI->Init()) {
+            delete m_dndUI;
+            m_dndUI = nullptr;
+         }
+      }
+
+      if (m_dndUI) {
+         wrapper->SetDnDIsRegistered(TRUE);
+         m_dndUI->SetDnDAllowed(TRUE);
+         int version = wrapper->GetDnDVersion();
+         g_debug("%s: dnd version is %d\n", __FUNCTION__, version);
+         if (version >= 3) {
+            DnDVersionChanged(version);
          }
       }
    }

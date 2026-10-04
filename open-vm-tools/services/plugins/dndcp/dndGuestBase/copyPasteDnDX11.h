@@ -59,7 +59,7 @@ public:
    void SetCopyPasteAllowed(bool allowed);
 private:
    CopyPasteUIX11 *m_copyPasteUI;
-   DnDUIX11 *m_dndUI;
+   DnDUI *m_dndUI;
 #if defined(GTK3)
    Gtk::Main *m_main;
 #endif

@@ -138,3 +138,30 @@ cpFileContents.h: cpFileContents.x
 
 cpFileContents_xdr.c: cpFileContents.x cpFileContents.h
 	@RPCGEN_WRAPPER@ services/plugins/dndcp/cpFileContents.x $@
+
+if HAVE_WAYLAND_DND
+libdndcp_la_CPPFLAGS += @WAYLAND_CFLAGS@
+libdndcp_la_CPPFLAGS += -DHAVE_WAYLAND_DND
+libdndcp_la_LIBADD   += @WAYLAND_LIBS@
+libdndcp_la_SOURCES  += dndUIWayland.cpp
+nodist_libdndcp_la_SOURCES =
+nodist_libdndcp_la_SOURCES += wlr-layer-shell-unstable-v1-protocol.c
+nodist_libdndcp_la_SOURCES += xdg-shell-protocol.c
+
+BUILT_SOURCES += wlr-layer-shell-unstable-v1-client-protocol.h
+BUILT_SOURCES += wlr-layer-shell-unstable-v1-protocol.c
+BUILT_SOURCES += xdg-shell-protocol.c
+
+wlr-layer-shell-unstable-v1-client-protocol.h: $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml
+	$(WAYLAND_SCANNER) client-header $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml $@
+
+wlr-layer-shell-unstable-v1-protocol.c: $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml
+	$(WAYLAND_SCANNER) private-code $(srcdir)/wayland/wlr-layer-shell-unstable-v1.xml $@
+
+xdg-shell-protocol.c: $(srcdir)/wayland/xdg-shell.xml
+	$(WAYLAND_SCANNER) private-code $(srcdir)/wayland/xdg-shell.xml $@
+endif
+
+EXTRA_DIST =
+EXTRA_DIST += wayland/wlr-layer-shell-unstable-v1.xml
+EXTRA_DIST += wayland/xdg-shell.xml

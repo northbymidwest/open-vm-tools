@@ -246,6 +246,14 @@ AC_ARG_WITH(
    [with_gtk3="$withval"],
    [with_gtk3="auto"])
 
+AC_ARG_WITH(
+   wayland,
+   AS_HELP_STRING(
+      [--without-wayland],
+      [compiles the dndcp plugin without native Wayland drag and drop]),
+   [with_wayland="$withval"],
+   [with_wayland="auto"])
+
 
 # only one "with_gtkX" option allowed
 num_gtk_args=0
@@ -1675,6 +1683,29 @@ else
    have_gtkmm="no"
    AC_MSG_WARN('dndcp plugin will not build without gtkmm')
 fi
+
+#
+# Native Wayland drag and drop for dndcp needs wayland-client and
+# wayland-scanner; the protocol XML it uses is shipped in the plugin.
+#
+have_wayland="no"
+if test "$with_wayland" != "no" && test "$os" = "linux" && \
+   test "$have_x" = "yes" && test "$have_gtkmm" = "yes"; then
+   PKG_CHECK_MODULES(
+      [WAYLAND],
+      [wayland-client],
+      [AC_PATH_PROG([WAYLAND_SCANNER], [wayland-scanner], [])
+       if test -n "$WAYLAND_SCANNER"; then
+          have_wayland="yes"
+       fi],
+      [true])
+   if test "$have_wayland" != "yes"; then
+      if test "$with_wayland" = "yes"; then
+         AC_MSG_ERROR([wayland-client and wayland-scanner are needed for --with-wayland.])
+      fi
+      AC_MSG_WARN([dndcp will be built without native Wayland drag and drop])
+   fi
+fi
 AM_CONDITIONAL(LINUX, test "$os" = "linux")
 AM_CONDITIONAL(SOLARIS, test "$os" = "solaris")
 AM_CONDITIONAL(FREEBSD, test "$os" = "freebsd" -o "$os" = "kfreebsd-gnu")
@@ -1696,6 +1727,7 @@ AM_CONDITIONAL(HAVE_FUSE3, test "$have_fuse3" = "yes")
 AM_CONDITIONAL(HAVE_GNU_LD, test "$with_gnu_ld" = "yes")
 AM_CONDITIONAL(HAVE_GTK4,  test "$have_x" = "yes" && test "$with_gtk4" = "yes")
 AM_CONDITIONAL(HAVE_GTKMM,  test "$have_x" = "yes" && test "$have_gtkmm" = "yes")
+AM_CONDITIONAL(HAVE_WAYLAND_DND, test "$have_wayland" = "yes")
 AM_CONDITIONAL(HAVE_PAM, test "$with_pam" = "yes")
 AM_CONDITIONAL(USE_SLASH_PROC, test "$os" = "linux")
 AM_CONDITIONAL(ENABLE_CONTAINERINFO, test "$enable_containerinfo" = "yes")

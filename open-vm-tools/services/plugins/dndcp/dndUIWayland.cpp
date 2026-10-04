@@ -1,0 +1,2509 @@
+/*********************************************************
+ * Copyright (c) 2026 Michael Bryniarski.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published
+ * by the Free Software Foundation version 2.1 and no later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
+ *
+ *********************************************************/
+
+/**
+ * @file dndUIWayland.cpp --
+ *
+ *    Native Wayland DnD UI. Mirrors DnDUIX11's handling of the common DnD
+ *    layer's signals, using Wayland protocols in place of X11 and GTK+ DnD:
+ *
+ *    - The drag detection window is a zwlr_layer_shell_v1 surface on the
+ *      overlay layer, because only layer surfaces can be placed at exact
+ *      screen coordinates. It stays mapped and fully transparent; "hiding"
+ *      it empties its input region.
+ *
+ *    - Host-to-guest: the uinput pointer (fakeMouseWayland) presses on the
+ *      detection surface, and the serial of that press starts a
+ *      wl_data_device drag from it. The pointer then follows the host's
+ *      DND_CMD_MOVE_MOUSE updates and is released on drop.
+ *
+ *    - Guest-to-host: the detection surface is shown where the host asks and
+ *      the uinput pointer is moved onto it. A guest drag held over it shows
+ *      up as wl_data_device enter with an offer, whose data is read right
+ *      away and handed to the host.
+ */
+
+#define G_LOG_DOMAIN "dndcp"
+
+#include <errno.h>
+#include <fcntl.h>
+/* lib/include/poll.h is VMware's Poll API, not the system header. */
+#include <sys/poll.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include <algorithm>
+
+#include <glib-unix.h>
+#include <gio/gio.h>
+#include <wayland-client.h>
+
+/* The layer-shell protocol names an argument "namespace", a C++ keyword. */
+#define namespace namespace_
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
+
+#include "dndUIWayland.h"
+#include "guestDnDCPMgr.hh"
+#include "tracer.hh"
+#include "fakeMouseWayland/fakeMouseWayland.h"
+#include "dndFileList.hh"
+
+#include "dynbuf.h"
+#include "dndMsg.h"
+#include "file.h"
+extern "C" {
+#include "hgfsUri.h"
+}
+#include "str.h"
+
+/*
+ * The detection surface is twice the detection window width, like
+ * DnDUIX11::OnUpdateDetWnd's SetGeometry.
+ */
+#define DET_WND_SIZE (DRAG_DET_WINDOW_WIDTH * 2)
+
+/* How long to wait for the compositor during a synchronous step. */
+#define WAYLAND_WAIT_MS 500
+
+#define GUEST_DND_TARGET_FMT "guest-dnd-target %d"
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * Listener trampolines --
+ *
+ *      libwayland listeners are C structs of function pointers. These forward
+ *      to the DnDUIWayland passed as user data. The structs are filled in at
+ *      runtime so only the events of the versions we bind are referenced,
+ *      which keeps this independent of the libwayland headers' version.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+#define UI(data) (static_cast<DnDUIWayland *>(data))
+
+static void
+RegistryGlobal(void *data, struct wl_registry *reg, uint32_t name,
+               const char *iface, uint32_t version)
+{
+   UI(data)->OnRegistryGlobal(reg, name, iface, version);
+}
+
+static void
+RegistryGlobalRemove(void *data, struct wl_registry *reg, uint32_t name)
+{
+}
+
+static void
+OutputGeometry(void *data, struct wl_output *o, int32_t x, int32_t y,
+               int32_t pw, int32_t ph, int32_t subpixel, const char *make,
+               const char *model, int32_t transform)
+{
+}
+
+static void
+OutputMode(void *data, struct wl_output *o, uint32_t flags, int32_t w,
+           int32_t h, int32_t refresh)
+{
+   UI(data)->OnOutputMode(flags, w, h);
+}
+
+static void
+OutputDone(void *data, struct wl_output *o)
+{
+}
+
+static void
+OutputScale(void *data, struct wl_output *o, int32_t scale)
+{
+   UI(data)->OnOutputScale(scale);
+}
+
+static void
+SeatCapabilities(void *data, struct wl_seat *seat, uint32_t caps)
+{
+   UI(data)->OnSeatCapabilities(caps);
+}
+
+static void
+SeatName(void *data, struct wl_seat *seat, const char *name)
+{
+}
+
+static void
+PointerEnter(void *data, struct wl_pointer *p, uint32_t serial,
+             struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
+{
+   UI(data)->OnPointerEnter(surface);
+}
+
+static void
+PointerLeave(void *data, struct wl_pointer *p, uint32_t serial,
+             struct wl_surface *surface)
+{
+   UI(data)->OnPointerLeave(surface);
+}
+
+static void
+PointerMotion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t x,
+              wl_fixed_t y)
+{
+}
+
+static void
+PointerButton(void *data, struct wl_pointer *p, uint32_t serial,
+              uint32_t time, uint32_t button, uint32_t state)
+{
+   UI(data)->OnPointerButton(serial, state);
+}
+
+static void
+PointerAxis(void *data, struct wl_pointer *p, uint32_t time, uint32_t axis,
+            wl_fixed_t value)
+{
+}
+
+static void
+PointerFrame(void *data, struct wl_pointer *p)
+{
+}
+
+static void
+PointerAxisSource(void *data, struct wl_pointer *p, uint32_t source)
+{
+}
+
+static void
+PointerAxisStop(void *data, struct wl_pointer *p, uint32_t time,
+                uint32_t axis)
+{
+}
+
+static void
+PointerAxisDiscrete(void *data, struct wl_pointer *p, uint32_t axis,
+                    int32_t discrete)
+{
+}
+
+static void
+LayerConfigure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t serial,
+               uint32_t w, uint32_t h)
+{
+   UI(data)->OnLayerConfigure(ls, serial);
+}
+
+static void
+LayerClosed(void *data, struct zwlr_layer_surface_v1 *ls)
+{
+   g_debug("%s: detection surface closed by the compositor\n", __FUNCTION__);
+}
+
+static void
+SourceTarget(void *data, struct wl_data_source *s, const char *mimeType)
+{
+   g_debug("%s: target accepts %s\n", __FUNCTION__,
+           mimeType ? mimeType : "nothing");
+}
+
+static void
+SourceSend(void *data, struct wl_data_source *s, const char *mimeType,
+           int32_t fd)
+{
+   UI(data)->OnSourceSend(s, mimeType, fd);
+}
+
+static void
+SourceCancelled(void *data, struct wl_data_source *s)
+{
+   UI(data)->OnSourceEnded(s, false);
+}
+
+static void
+SourceDndDropPerformed(void *data, struct wl_data_source *s)
+{
+   g_debug("%s: drop performed\n", __FUNCTION__);
+}
+
+static void
+SourceDndFinished(void *data, struct wl_data_source *s)
+{
+   UI(data)->OnSourceEnded(s, true);
+}
+
+static void
+SourceAction(void *data, struct wl_data_source *s, uint32_t action)
+{
+   UI(data)->OnSourceAction(s, action);
+}
+
+static void
+OfferOffer(void *data, struct wl_data_offer *o, const char *mimeType)
+{
+   UI(data)->OnOfferMimeType(o, mimeType);
+}
+
+static void
+OfferSourceActions(void *data, struct wl_data_offer *o, uint32_t actions)
+{
+   UI(data)->OnOfferSourceActions(o, actions);
+}
+
+static void
+OfferAction(void *data, struct wl_data_offer *o, uint32_t action)
+{
+}
+
+static void
+DeviceDataOffer(void *data, struct wl_data_device *d, struct wl_data_offer *o)
+{
+   UI(data)->OnDataOffer(o);
+}
+
+static void
+DeviceEnter(void *data, struct wl_data_device *d, uint32_t serial,
+            struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
+            struct wl_data_offer *o)
+{
+   UI(data)->OnDeviceEnter(serial, surface, o);
+}
+
+static void
+DeviceLeave(void *data, struct wl_data_device *d)
+{
+   UI(data)->OnDeviceLeave();
+}
+
+static void
+DeviceMotion(void *data, struct wl_data_device *d, uint32_t time,
+             wl_fixed_t x, wl_fixed_t y)
+{
+}
+
+static void
+DeviceDrop(void *data, struct wl_data_device *d)
+{
+   UI(data)->OnDeviceDrop();
+}
+
+static void
+DeviceSelection(void *data, struct wl_data_device *d, struct wl_data_offer *o)
+{
+   UI(data)->OnSelectionOffer(o);
+}
+
+static struct wl_registry_listener sRegistryListener;
+static struct wl_output_listener sOutputListener;
+static struct wl_seat_listener sSeatListener;
+static struct wl_pointer_listener sPointerListener;
+static struct zwlr_layer_surface_v1_listener sLayerListener;
+static struct wl_data_source_listener sSourceListener;
+static struct wl_data_offer_listener sOfferListener;
+static struct wl_data_device_listener sDeviceListener;
+
+
+static void
+InitListeners()
+{
+   static bool done = false;
+
+   if (done) {
+      return;
+   }
+   done = true;
+
+   sRegistryListener.global = RegistryGlobal;
+   sRegistryListener.global_remove = RegistryGlobalRemove;
+
+   /* Bound at version 2. */
+   sOutputListener.geometry = OutputGeometry;
+   sOutputListener.mode = OutputMode;
+   sOutputListener.done = OutputDone;
+   sOutputListener.scale = OutputScale;
+
+   sSeatListener.capabilities = SeatCapabilities;
+   sSeatListener.name = SeatName;
+
+   /* Bound at version 5. */
+   sPointerListener.enter = PointerEnter;
+   sPointerListener.leave = PointerLeave;
+   sPointerListener.motion = PointerMotion;
+   sPointerListener.button = PointerButton;
+   sPointerListener.axis = PointerAxis;
+   sPointerListener.frame = PointerFrame;
+   sPointerListener.axis_source = PointerAxisSource;
+   sPointerListener.axis_stop = PointerAxisStop;
+   sPointerListener.axis_discrete = PointerAxisDiscrete;
+
+   sLayerListener.configure = LayerConfigure;
+   sLayerListener.closed = LayerClosed;
+
+   /* Bound at version 3. */
+   sSourceListener.target = SourceTarget;
+   sSourceListener.send = SourceSend;
+   sSourceListener.cancelled = SourceCancelled;
+   sSourceListener.dnd_drop_performed = SourceDndDropPerformed;
+   sSourceListener.dnd_finished = SourceDndFinished;
+   sSourceListener.action = SourceAction;
+
+   sOfferListener.offer = OfferOffer;
+   sOfferListener.source_actions = OfferSourceActions;
+   sOfferListener.action = OfferAction;
+
+   sDeviceListener.data_offer = DeviceDataOffer;
+   sDeviceListener.enter = DeviceEnter;
+   sDeviceListener.leave = DeviceLeave;
+   sDeviceListener.motion = DeviceMotion;
+   sDeviceListener.drop = DeviceDrop;
+   sDeviceListener.selection = DeviceSelection;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * Wayland GSource --
+ *
+ *      Dispatches the Wayland connection from vmusr's GLib main loop.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+struct WaylandSource {
+   GSource source;
+   struct wl_display *display;
+   gpointer fdTag;
+};
+
+
+static gboolean
+WaylandSourcePrepare(GSource *base,
+                     gint *timeout)
+{
+   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
+
+   *timeout = -1;
+   wl_display_dispatch_pending(src->display);
+   wl_display_flush(src->display);
+   return FALSE;
+}
+
+
+static gboolean
+WaylandSourceCheck(GSource *base)
+{
+   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
+
+   return g_source_query_unix_fd(base, src->fdTag) != 0;
+}
+
+
+static gboolean
+WaylandSourceDispatch(GSource *base,
+                      GSourceFunc callback,
+                      gpointer data)
+{
+   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
+   GIOCondition cond = g_source_query_unix_fd(base, src->fdTag);
+
+   if (cond & (G_IO_ERR | G_IO_HUP)) {
+      g_warning("%s: lost the Wayland connection\n", __FUNCTION__);
+      return G_SOURCE_REMOVE;
+   }
+   if ((cond & G_IO_IN) && wl_display_dispatch(src->display) < 0) {
+      g_warning("%s: wl_display_dispatch failed: %s\n", __FUNCTION__,
+                strerror(errno));
+      return G_SOURCE_REMOVE;
+   }
+   return G_SOURCE_CONTINUE;
+}
+
+
+static GSourceFuncs sWaylandSourceFuncs = {
+   WaylandSourcePrepare,
+   WaylandSourceCheck,
+   WaylandSourceDispatch,
+   NULL,
+};
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWaylandTransfer --
+ *
+ *      One in-flight read (guest-to-host offer data) or write (host-to-guest
+ *      source data) on a pipe, driven by a GLib fd watch so a slow peer
+ *      can't block vmusr's main loop.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+struct DnDUIWaylandTransfer {
+   DnDUIWayland *ui;
+   int fd;
+   guint watch;
+   std::string mimeType;
+   std::string data;
+   size_t offset;
+
+   static gboolean OnReadable(gint fd, GIOCondition cond, gpointer data);
+   static gboolean OnWritable(gint fd, GIOCondition cond, gpointer data);
+   static void Free(gpointer data);
+   void Unwatch();
+};
+
+
+void
+DnDUIWaylandTransfer::Unwatch()
+{
+   std::vector<guint> &w = ui->mIoWatches;
+   w.erase(std::remove(w.begin(), w.end(), watch), w.end());
+}
+
+
+void
+DnDUIWaylandTransfer::Free(gpointer data)
+{
+   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
+
+   close(t->fd);
+   delete t;
+}
+
+
+gboolean
+DnDUIWaylandTransfer::OnReadable(gint fd,
+                                 GIOCondition cond,
+                                 gpointer data)
+{
+   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
+   char buf[4096];
+   ssize_t n;
+
+   while ((n = read(fd, buf, sizeof buf)) > 0) {
+      t->data.append(buf, n);
+   }
+   if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+      return G_SOURCE_CONTINUE;
+   }
+   if (n < 0) {
+      g_debug("%s: read failed: %s\n", __FUNCTION__, strerror(errno));
+   }
+   t->Unwatch();
+   t->ui->OnReceiveDone(t->mimeType, t->data);
+   return G_SOURCE_REMOVE;
+}
+
+
+gboolean
+DnDUIWaylandTransfer::OnWritable(gint fd,
+                                 GIOCondition cond,
+                                 gpointer data)
+{
+   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
+
+   while (t->offset < t->data.size()) {
+      ssize_t n = write(fd, t->data.data() + t->offset,
+                        t->data.size() - t->offset);
+      if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+         return G_SOURCE_CONTINUE;
+      }
+      if (n < 0) {
+         g_debug("%s: write failed: %s\n", __FUNCTION__, strerror(errno));
+         break;
+      }
+      t->offset += n;
+   }
+   t->Unwatch();
+   return G_SOURCE_REMOVE;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::DnDUIWayland --
+ *
+ *      Constructor.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DnDUIWayland::DnDUIWayland(ToolsAppCtx *ctx)
+    : mCtx(ctx),
+      mDnD(NULL),
+      mBlockCtrl(NULL),
+      mDisplay(NULL),
+      mRegistry(NULL),
+      mCompositor(NULL),
+      mShm(NULL),
+      mSeat(NULL),
+      mPointer(NULL),
+      mOutput(NULL),
+      mDataDeviceManager(NULL),
+      mDataDevice(NULL),
+      mLayerShell(NULL),
+      mSource(NULL),
+      mSurface(NULL),
+      mLayerSurface(NULL),
+      mBuffer(NULL),
+      mConfigured(false),
+      mDetWndShown(false),
+      mDetWndX(0),
+      mDetWndY(0),
+      mModeWidth(0),
+      mModeHeight(0),
+      mScale(1),
+      mScreenWidth(0),
+      mScreenHeight(0),
+      mUseUInput(false),
+      mPointerInDetWnd(false),
+      mPressed(false),
+      mPressSerial(0),
+      mDataSource(NULL),
+      mHGGetFileStatus(DND_FILE_TRANSFER_NOT_STARTED),
+      mBlockAdded(false),
+      mInHGDrag(false),
+      mEffect(DROP_NONE),
+      mSourceAction(0),
+      mTotalFileSize(0),
+      mMousePosX(0),
+      mMousePosY(0),
+      mPendingOffer(NULL),
+      mOffer(NULL),
+      mPendingOfferActions(0),
+      mOfferActions(0),
+      mOfferAction(0),
+      mGHDnDInProgress(false),
+      mGHDnDDataReceived(false),
+      mNumPendingRequest(0),
+      mDestDropTime(0)
+{
+   TRACE_CALL();
+   InitListeners();
+   CPClipboard_Init(&mClipboard);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::~DnDUIWayland --
+ *
+ *      Destructor.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+DnDUIWayland::~DnDUIWayland()
+{
+   TRACE_CALL();
+
+   /* Any files from last unfinished file transfer should be deleted. */
+   if (   DND_FILE_TRANSFER_IN_PROGRESS == mHGGetFileStatus
+       && !mHGStagingDir.empty()) {
+      uint64 totalSize = File_GetSizeEx(mHGStagingDir.c_str());
+      if (mTotalFileSize != totalSize) {
+         g_debug("%s: deleting %s, expecting %" FMT64 "u, finished %" FMT64 "u\n",
+                 __FUNCTION__, mHGStagingDir.c_str(),
+                 mTotalFileSize, totalSize);
+         DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
+      }
+   }
+   ResetUI();
+
+   while (!mIoWatches.empty()) {
+      guint watch = mIoWatches.back();
+      mIoWatches.pop_back();
+      g_source_remove(watch);
+   }
+   Disconnect();
+   if (mUseUInput) {
+      FakeMouse_Destory();
+   }
+   CPClipboard_Destroy(&mClipboard);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::IsSupported --
+ *
+ *      Whether vmusr runs in a Wayland session whose compositor offers what
+ *      this UI needs. VMTOOLS_DND_BACKEND=x11 or =wayland forces a choice.
+ *
+ * Results:
+ *      true if DnDUIWayland should be used instead of DnDUIX11.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+/* static */ bool
+DnDUIWayland::IsSupported()
+{
+   const char *forced = getenv("VMTOOLS_DND_BACKEND");
+   const char *sessionType = getenv("XDG_SESSION_TYPE");
+
+   if (forced != NULL && strcmp(forced, "x11") == 0) {
+      g_debug("%s: X11 forced by VMTOOLS_DND_BACKEND\n", __FUNCTION__);
+      return false;
+   }
+   if (   (forced == NULL || strcmp(forced, "wayland") != 0)
+       && (sessionType == NULL || strcmp(sessionType, "wayland") != 0)) {
+      return false;
+   }
+
+   struct wl_display *display = wl_display_connect(NULL);
+   if (display == NULL) {
+      g_debug("%s: no Wayland display\n", __FUNCTION__);
+      return false;
+   }
+
+   struct Globals {
+      bool layerShell;
+      bool dataDevice;
+   } globals = { false, false };
+
+   static struct wl_registry_listener probe;
+   probe.global = [](void *data, struct wl_registry *reg, uint32_t name,
+                     const char *iface, uint32_t version) {
+      Globals *g = static_cast<Globals *>(data);
+      if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
+         g->layerShell = true;
+      } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0) {
+         g->dataDevice = version >= 3;
+      }
+   };
+   probe.global_remove = RegistryGlobalRemove;
+
+   struct wl_registry *reg = wl_display_get_registry(display);
+   wl_registry_add_listener(reg, &probe, &globals);
+   wl_display_roundtrip(display);
+   wl_registry_destroy(reg);
+   wl_display_disconnect(display);
+
+   g_debug("%s: layer shell %d, data device v3 %d\n", __FUNCTION__,
+           globals.layerShell, globals.dataDevice);
+   return globals.layerShell && globals.dataDevice;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::Init --
+ *
+ *      Connect to the compositor, create the uinput pointer and the
+ *      detection surface, and hook up the common DnD layer.
+ *
+ * Results:
+ *      Returns true on success and false on failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::Init()
+{
+   TRACE_CALL();
+
+   GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+   ASSERT(p);
+   mDnD = p->GetDnDMgr();
+   ASSERT(mDnD);
+
+   /* Without uinput there is no way to start a drag from a press. */
+   if (mCtx->uinputFD == -1) {
+      g_debug("%s: no uinput fd\n", __FUNCTION__);
+      return false;
+   }
+
+   if (!Connect()) {
+      Disconnect();
+      return false;
+   }
+
+   if (!FakeMouse_Init(mCtx->uinputFD, mScreenWidth, mScreenHeight)) {
+      g_debug("%s: FakeMouse_Init failed\n", __FUNCTION__);
+      Disconnect();
+      return false;
+   }
+   mUseUInput = true;
+
+   if (!CreateDetWnd()) {
+      Disconnect();
+      return false;
+   }
+
+#define CONNECT_SIGNAL(_obj, _sig, _cb) \
+   _obj->_sig.connect(sigc::mem_fun(this, &DnDUIWayland::_cb))
+
+   /* Set common layer callbacks. */
+   CONNECT_SIGNAL(mDnD, srcDragBeginChanged,   OnSrcDragBegin);
+   CONNECT_SIGNAL(mDnD, srcDropChanged,        OnSrcDrop);
+   CONNECT_SIGNAL(mDnD, srcCancelChanged,      OnSrcCancel);
+   CONNECT_SIGNAL(mDnD, destCancelChanged,     OnDestCancel);
+   CONNECT_SIGNAL(mDnD, destMoveDetWndToMousePosChanged, OnDestMoveDetWndToMousePos);
+   CONNECT_SIGNAL(mDnD, getFilesDoneChanged,   OnGetFilesDone);
+   CONNECT_SIGNAL(mDnD, moveMouseChanged,      OnMoveMouse);
+   CONNECT_SIGNAL(mDnD, privDropChanged,       OnPrivateDrop);
+   CONNECT_SIGNAL(mDnD, updateDetWndChanged,   OnUpdateDetWnd);
+
+#undef CONNECT_SIGNAL
+
+   g_debug("%s: native Wayland DnD, screen %dx%d (scale %d)\n", __FUNCTION__,
+           mScreenWidth, mScreenHeight, mScale);
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::Connect --
+ *
+ *      Connect to the compositor, bind the globals we need, and attach the
+ *      connection to the default GLib main context.
+ *
+ * Results:
+ *      true if every required global is present.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::Connect()
+{
+   mDisplay = wl_display_connect(NULL);
+   if (mDisplay == NULL) {
+      g_debug("%s: wl_display_connect failed\n", __FUNCTION__);
+      return false;
+   }
+
+   mRegistry = wl_display_get_registry(mDisplay);
+   wl_registry_add_listener(mRegistry, &sRegistryListener, this);
+   /* Globals, then the events of the objects bound from them. */
+   wl_display_roundtrip(mDisplay);
+   wl_display_roundtrip(mDisplay);
+
+   if (   mCompositor == NULL || mShm == NULL || mSeat == NULL
+       || mOutput == NULL || mDataDeviceManager == NULL
+       || mLayerShell == NULL || mPointer == NULL) {
+      g_debug("%s: missing globals: compositor %p shm %p seat %p output %p "
+              "data device manager %p layer shell %p pointer %p\n",
+              __FUNCTION__, mCompositor, mShm, mSeat, mOutput,
+              mDataDeviceManager, mLayerShell, mPointer);
+      return false;
+   }
+   if (mScreenWidth <= 0 || mScreenHeight <= 0) {
+      g_debug("%s: no output mode\n", __FUNCTION__);
+      return false;
+   }
+
+   mDataDevice = wl_data_device_manager_get_data_device(mDataDeviceManager,
+                                                        mSeat);
+   wl_data_device_add_listener(mDataDevice, &sDeviceListener, this);
+
+   WaylandSource *src = reinterpret_cast<WaylandSource *>(
+      g_source_new(&sWaylandSourceFuncs, sizeof(WaylandSource)));
+   src->display = mDisplay;
+   src->fdTag = g_source_add_unix_fd(&src->source,
+                                     wl_display_get_fd(mDisplay),
+                                     (GIOCondition)(G_IO_IN | G_IO_ERR |
+                                                    G_IO_HUP));
+   g_source_attach(&src->source, NULL);
+   mSource = &src->source;
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::Disconnect --
+ *
+ *      Destroy every Wayland object and close the connection.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::Disconnect()
+{
+   DestroySource();
+   DestroyOffer();
+   if (mPendingOffer) {
+      wl_data_offer_destroy(mPendingOffer);
+      mPendingOffer = NULL;
+   }
+   if (mSource) {
+      g_source_destroy(mSource);
+      g_source_unref(mSource);
+      mSource = NULL;
+   }
+   if (mLayerSurface) {
+      zwlr_layer_surface_v1_destroy(mLayerSurface);
+      mLayerSurface = NULL;
+   }
+   if (mSurface) {
+      wl_surface_destroy(mSurface);
+      mSurface = NULL;
+   }
+   if (mBuffer) {
+      wl_buffer_destroy(mBuffer);
+      mBuffer = NULL;
+   }
+   if (mDataDevice) {
+      wl_data_device_release(mDataDevice);
+      mDataDevice = NULL;
+   }
+   if (mPointer) {
+      wl_pointer_release(mPointer);
+      mPointer = NULL;
+   }
+   if (mLayerShell) {
+      zwlr_layer_shell_v1_destroy(mLayerShell);
+      mLayerShell = NULL;
+   }
+   if (mDataDeviceManager) {
+      wl_data_device_manager_destroy(mDataDeviceManager);
+      mDataDeviceManager = NULL;
+   }
+   if (mOutput) {
+      wl_output_destroy(mOutput);
+      mOutput = NULL;
+   }
+   if (mSeat) {
+      wl_seat_destroy(mSeat);
+      mSeat = NULL;
+   }
+   if (mShm) {
+      wl_shm_destroy(mShm);
+      mShm = NULL;
+   }
+   if (mCompositor) {
+      wl_compositor_destroy(mCompositor);
+      mCompositor = NULL;
+   }
+   if (mRegistry) {
+      wl_registry_destroy(mRegistry);
+      mRegistry = NULL;
+   }
+   if (mDisplay) {
+      wl_display_disconnect(mDisplay);
+      mDisplay = NULL;
+   }
+}
+
+
+void
+DnDUIWayland::OnRegistryGlobal(struct wl_registry *reg,   // IN
+                               uint32 name,               // IN
+                               const char *iface,         // IN
+                               uint32 version)            // IN
+{
+   if (strcmp(iface, wl_compositor_interface.name) == 0) {
+      mCompositor = static_cast<struct wl_compositor *>(
+         wl_registry_bind(reg, name, &wl_compositor_interface,
+                          MIN(version, 4)));
+   } else if (strcmp(iface, wl_shm_interface.name) == 0) {
+      mShm = static_cast<struct wl_shm *>(
+         wl_registry_bind(reg, name, &wl_shm_interface, 1));
+   } else if (strcmp(iface, wl_seat_interface.name) == 0 && mSeat == NULL) {
+      if (version < 5) {
+         g_debug("%s: wl_seat version %u is too old\n", __FUNCTION__, version);
+         return;
+      }
+      mSeat = static_cast<struct wl_seat *>(
+         wl_registry_bind(reg, name, &wl_seat_interface, 5));
+      wl_seat_add_listener(mSeat, &sSeatListener, this);
+   } else if (strcmp(iface, wl_output_interface.name) == 0 && mOutput == NULL) {
+      /*
+       * Like DnDUIX11's default screen, only the first output is used; the
+       * VM presents a single logical monitor for DnD.
+       */
+      mOutput = static_cast<struct wl_output *>(
+         wl_registry_bind(reg, name, &wl_output_interface, MIN(version, 2)));
+      wl_output_add_listener(mOutput, &sOutputListener, this);
+   } else if (strcmp(iface, wl_data_device_manager_interface.name) == 0) {
+      if (version < 3) {
+         g_debug("%s: wl_data_device_manager version %u has no DnD actions\n",
+                 __FUNCTION__, version);
+         return;
+      }
+      mDataDeviceManager = static_cast<struct wl_data_device_manager *>(
+         wl_registry_bind(reg, name, &wl_data_device_manager_interface, 3));
+   } else if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
+      mLayerShell = static_cast<struct zwlr_layer_shell_v1 *>(
+         wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
+                          MIN(version, 3)));
+   }
+}
+
+
+void
+DnDUIWayland::OnOutputMode(uint32 flags,    // IN
+                           int32 width,     // IN
+                           int32 height)    // IN
+{
+   if (flags & WL_OUTPUT_MODE_CURRENT) {
+      mModeWidth = width;
+      mModeHeight = height;
+      UpdateFakeMouseSize();
+   }
+}
+
+
+void
+DnDUIWayland::OnOutputScale(int32 scale)    // IN
+{
+   mScale = scale > 0 ? scale : 1;
+   UpdateFakeMouseSize();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::UpdateFakeMouseSize --
+ *
+ *      Keep the uinput pointer's absolute range equal to the output's size
+ *      in logical pixels, the space layer-shell margins are given in.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::UpdateFakeMouseSize()
+{
+   int32 width = mModeWidth / mScale;
+   int32 height = mModeHeight / mScale;
+
+   if (width == mScreenWidth && height == mScreenHeight) {
+      return;
+   }
+   g_debug("%s: screen %dx%d -> %dx%d\n", __FUNCTION__,
+           mScreenWidth, mScreenHeight, width, height);
+   mScreenWidth = width;
+   mScreenHeight = height;
+   if (mUseUInput) {
+      FakeMouse_Update(mScreenWidth, mScreenHeight);
+   }
+}
+
+
+void
+DnDUIWayland::OnSeatCapabilities(uint32 caps)   // IN
+{
+   if ((caps & WL_SEAT_CAPABILITY_POINTER) && mPointer == NULL) {
+      mPointer = wl_seat_get_pointer(mSeat);
+      wl_pointer_add_listener(mPointer, &sPointerListener, this);
+   }
+}
+
+
+void
+DnDUIWayland::OnPointerEnter(struct wl_surface *surface)   // IN
+{
+   if (surface == mSurface) {
+      mPointerInDetWnd = true;
+   }
+}
+
+
+void
+DnDUIWayland::OnPointerLeave(struct wl_surface *surface)   // IN
+{
+   if (surface == mSurface) {
+      mPointerInDetWnd = false;
+   }
+}
+
+
+void
+DnDUIWayland::OnPointerButton(uint32 serial,   // IN
+                              uint32 state)    // IN
+{
+   if (state == WL_POINTER_BUTTON_STATE_PRESSED && mPointerInDetWnd) {
+      mPressSerial = serial;
+      mPressed = true;
+   }
+}
+
+
+void
+DnDUIWayland::OnLayerConfigure(struct zwlr_layer_surface_v1 *ls,   // IN
+                               uint32 serial)                      // IN
+{
+   zwlr_layer_surface_v1_ack_configure(ls, serial);
+   mConfigured = true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::WaitFor --
+ *
+ *      Dispatch Wayland events until flag becomes true or the timeout
+ *      passes. Used for the steps DnDUIX11 performs synchronously with
+ *      XSynchronize.
+ *
+ * Results:
+ *      The final value of flag.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::WaitFor(const bool &flag,   // IN
+                      int timeoutMs)      // IN
+{
+   unsigned long deadline = GetTimeInMillis() + timeoutMs;
+
+   while (!flag) {
+      while (wl_display_prepare_read(mDisplay) != 0) {
+         if (wl_display_dispatch_pending(mDisplay) < 0) {
+            return flag;
+         }
+      }
+      if (flag) {
+         wl_display_cancel_read(mDisplay);
+         break;
+      }
+      wl_display_flush(mDisplay);
+
+      unsigned long now = GetTimeInMillis();
+      if (now >= deadline) {
+         wl_display_cancel_read(mDisplay);
+         break;
+      }
+
+      struct pollfd pfd;
+      pfd.fd = wl_display_get_fd(mDisplay);
+      pfd.events = POLLIN;
+      pfd.revents = 0;
+      if (poll(&pfd, 1, (int)(deadline - now)) > 0) {
+         if (wl_display_read_events(mDisplay) < 0) {
+            break;
+         }
+      } else {
+         wl_display_cancel_read(mDisplay);
+      }
+      wl_display_dispatch_pending(mDisplay);
+   }
+   return flag;
+}
+
+
+void
+DnDUIWayland::Flush()
+{
+   if (mDisplay) {
+      wl_display_flush(mDisplay);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::CreateDetWnd --
+ *
+ *      Create the detection surface: an overlay-layer surface anchored to the
+ *      top-left corner, positioned by its margins, with a fully transparent
+ *      buffer and, while hidden, an empty input region.
+ *
+ * Results:
+ *      true on success.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::CreateDetWnd()
+{
+   int stride = DET_WND_SIZE * 4;
+   int size = stride * DET_WND_SIZE;
+   int fd = memfd_create("vmware-dnd-detwnd", MFD_CLOEXEC);
+
+   if (fd < 0 || ftruncate(fd, size) < 0) {
+      g_debug("%s: shm buffer failed: %s\n", __FUNCTION__, strerror(errno));
+      if (fd >= 0) {
+         close(fd);
+      }
+      return false;
+   }
+   /* A new memfd reads as zeros: fully transparent ARGB. */
+   struct wl_shm_pool *pool = wl_shm_create_pool(mShm, fd, size);
+   mBuffer = wl_shm_pool_create_buffer(pool, 0, DET_WND_SIZE, DET_WND_SIZE,
+                                       stride, WL_SHM_FORMAT_ARGB8888);
+   wl_shm_pool_destroy(pool);
+   close(fd);
+
+   mSurface = wl_compositor_create_surface(mCompositor);
+   mLayerSurface = zwlr_layer_shell_v1_get_layer_surface(
+      mLayerShell, mSurface, mOutput, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+      "vmware-dnd-detection");
+   zwlr_layer_surface_v1_add_listener(mLayerSurface, &sLayerListener, this);
+   zwlr_layer_surface_v1_set_size(mLayerSurface, DET_WND_SIZE, DET_WND_SIZE);
+   zwlr_layer_surface_v1_set_anchor(mLayerSurface,
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                                    ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+   /* Ignore panels' exclusive zones so margins are screen coordinates. */
+   zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
+   zwlr_layer_surface_v1_set_keyboard_interactivity(mLayerSurface, 0);
+   wl_surface_commit(mSurface);
+
+   if (!WaitFor(mConfigured, WAYLAND_WAIT_MS)) {
+      g_debug("%s: detection surface was never configured\n", __FUNCTION__);
+      return false;
+   }
+
+   HideDetWnd();
+   wl_surface_attach(mSurface, mBuffer, 0, 0);
+   wl_surface_damage(mSurface, 0, 0, DET_WND_SIZE, DET_WND_SIZE);
+   wl_surface_commit(mSurface);
+   wl_display_roundtrip(mDisplay);
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::ShowDetWnd --
+ *
+ *      Move the detection surface's top-left corner to (x, y) and let it
+ *      take pointer input.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::ShowDetWnd(int32 x,   // IN
+                         int32 y)   // IN
+{
+   x = MAX(0, MIN(x, mScreenWidth - DET_WND_SIZE));
+   y = MAX(0, MIN(y, mScreenHeight - DET_WND_SIZE));
+
+   g_debug("%s: show at (%d, %d, %d, %d)\n", __FUNCTION__, x, y,
+           DET_WND_SIZE, DET_WND_SIZE);
+   zwlr_layer_surface_v1_set_margin(mLayerSurface, y, 0, 0, x);
+   /* NULL is an infinite input region: the whole surface. */
+   wl_surface_set_input_region(mSurface, NULL);
+   wl_surface_commit(mSurface);
+   mDetWndX = x;
+   mDetWndY = y;
+   mDetWndShown = true;
+   /* Make sure the move lands before any pointer events we fake next. */
+   wl_display_roundtrip(mDisplay);
+}
+
+
+void
+DnDUIWayland::HideDetWnd()
+{
+   struct wl_region *empty = wl_compositor_create_region(mCompositor);
+
+   g_debug("%s: hide\n", __FUNCTION__);
+   wl_surface_set_input_region(mSurface, empty);
+   wl_region_destroy(empty);
+   wl_surface_commit(mSurface);
+   mDetWndShown = false;
+   Flush();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::FakeMove --
+ *
+ *      Move the uinput pointer, in logical pixels. Two moves, like
+ *      DnDUIX11::SendFakeXEvents; this also matters because the kernel drops
+ *      absolute events that repeat the current value.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::FakeMove(int32 x,   // IN
+                       int32 y)   // IN
+{
+   FakeMouse_Move(x, y);
+   FakeMouse_Move(x + 1, y + 1);
+   g_debug("%s: move mouse to (%d, %d) and (%d, %d)\n", __FUNCTION__,
+           x, y, x + 1, y + 1);
+}
+
+
+void
+DnDUIWayland::FakeButton(bool press)   // IN
+{
+   g_debug("%s: faking left mouse button %s\n", __FUNCTION__,
+           press ? "press" : "release");
+   FakeMouse_Click(press);
+}
+
+
+void
+DnDUIWayland::VmxDnDVersionChanged(RpcChannel *chan,   // IN
+                                   uint32 version)     // IN
+{
+   ASSERT(mDnD);
+   mDnD->VmxDnDVersionChanged(version);
+}
+
+
+void
+DnDUIWayland::SetBlockControl(DnDBlockControl *blockCtrl)   // IN
+{
+   mBlockCtrl = blockCtrl;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::ResetUI --
+ *
+ *      Reset UI state variables.
+ *
+ * Side effects:
+ *      May remove a vmblock blocking entry.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::ResetUI()
+{
+   TRACE_CALL();
+   mGHDnDDataReceived = false;
+   mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+   mGHDnDInProgress = false;
+   mEffect = DROP_NONE;
+   mInHGDrag = false;
+   RemoveBlock();
+}
+
+
+/* Source functions for HG DnD. */
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSrcDragBegin --
+ *
+ *      Called when host successfully detected a pending HG drag. Presses the
+ *      uinput pointer on the detection surface and starts a Wayland drag
+ *      with that press's serial.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSrcDragBegin(const CPClipboard *clip,       // IN
+                             const std::string stagingDir)  // IN
+{
+   int32 mouseX = DRAG_DET_WINDOW_WIDTH / 2;
+   int32 mouseY = DRAG_DET_WINDOW_WIDTH / 2;
+
+   TRACE_CALL();
+
+   CPClipboard_Clear(&mClipboard);
+   CPClipboard_Copy(&mClipboard, clip);
+   mSourceMimeTypes.clear();
+
+   if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILELIST)) {
+      mHGStagingDir = stagingDir;
+      if (!mHGStagingDir.empty()) {
+         mSourceMimeTypes.push_back(DRAG_TARGET_NAME_URI_LIST);
+         /* Add private data to tag dnd as originating from this vm. */
+         char *pid = Str_Asprintf(NULL, GUEST_DND_TARGET_FMT,
+                                  static_cast<int>(getpid()));
+         if (pid) {
+            mSourceMimeTypes.push_back(pid);
+            free(pid);
+         }
+      }
+   }
+
+   if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILECONTENTS)) {
+      /* Only Windows hosts send file contents; not handled here yet. */
+      g_debug("%s: file contents DnD is not supported\n", __FUNCTION__);
+   }
+
+   if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_TEXT)) {
+      mSourceMimeTypes.push_back(TARGET_NAME_TEXT_PLAIN_UTF8);
+      mSourceMimeTypes.push_back(TARGET_NAME_UTF8_STRING);
+      mSourceMimeTypes.push_back(TARGET_NAME_TEXT_PLAIN);
+      mSourceMimeTypes.push_back(TARGET_NAME_STRING);
+   }
+
+   if (CPClipboard_ItemExists(&mClipboard, CPFORMAT_RTF)) {
+      mSourceMimeTypes.push_back(TARGET_NAME_TEXT_RTF);
+      mSourceMimeTypes.push_back(TARGET_NAME_APPLICATION_RTF);
+      mSourceMimeTypes.push_back(TARGET_NAME_TEXT_RICHTEXT);
+   }
+
+   if (mSourceMimeTypes.empty()) {
+      g_debug("%s: nothing we can offer\n", __FUNCTION__);
+      return;
+   }
+
+   /*
+    * Before the DnD, make sure our button is up, then put the pointer on
+    * the detection surface and wait for it to have pointer focus.
+    */
+   DestroySource();
+   FakeButton(false);
+   ShowDetWnd(0, 0);
+   mPressed = false;
+   /*
+    * The host usually shows the detection window just before this, which
+    * already moves the pointer onto it. Then there is no new enter to wait
+    * for, so mPointerInDetWnd must not be cleared here.
+    */
+   FakeMove(mouseX, mouseY);
+   if (!WaitFor(mPointerInDetWnd, WAYLAND_WAIT_MS)) {
+      g_debug("%s: pointer never entered the detection surface\n",
+              __FUNCTION__);
+      HideDetWnd();
+      return;
+   }
+
+   FakeButton(true);
+   if (!WaitFor(mPressed, WAYLAND_WAIT_MS)) {
+      g_debug("%s: never saw our press on the detection surface\n",
+              __FUNCTION__);
+      FakeButton(false);
+      HideDetWnd();
+      return;
+   }
+
+   mDataSource =
+      wl_data_device_manager_create_data_source(mDataDeviceManager);
+   wl_data_source_add_listener(mDataSource, &sSourceListener, this);
+   for (size_t i = 0; i < mSourceMimeTypes.size(); i++) {
+      wl_data_source_offer(mDataSource, mSourceMimeTypes[i].c_str());
+   }
+   wl_data_source_set_actions(mDataSource,
+                              WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                              WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+   wl_data_device_start_drag(mDataDevice, mDataSource, mSurface, NULL,
+                             mPressSerial);
+   g_debug("%s: started drag with serial %u\n", __FUNCTION__, mPressSerial);
+
+   /*
+    * Stop taking input so the drag can't end up dropping on its own
+    * detection surface.
+    */
+   HideDetWnd();
+
+   mBlockAdded = false;
+   mSourceAction = 0;
+   mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+   SourceDragStartDone();
+   /* Initialize host hide feedback to DROP_NONE. */
+   mEffect = DROP_NONE;
+   SourceUpdateFeedback(mEffect);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSrcCancel --
+ *
+ *      Handler for when host cancels HG drag. Destroying the data source
+ *      cancels the Wayland drag.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSrcCancel()
+{
+   TRACE_CALL();
+
+   DestroySource();
+   FakeButton(false);
+   FakeMove(mMousePosX, mMousePosY);
+   HideDetWnd();
+   mInHGDrag = false;
+   mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+   mEffect = DROP_NONE;
+   RemoveBlock();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSrcDrop --
+ *
+ *      Callback when host signals drop: release the button at the last
+ *      position the host gave us.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSrcDrop()
+{
+   TRACE_CALL();
+   FakeMove(mMousePosX, mMousePosY);
+   FakeButton(false);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSourceSend --
+ *
+ *      The drop target asks for the drag's data, like GTK+'s
+ *      "drag_data_get".
+ *
+ * Side effects:
+ *      May insert vmblock blocking entry and request host-to-guest file
+ *      transfer from host.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSourceSend(struct wl_data_source *source,   // IN
+                           const char *mimeType,            // IN
+                           int32 fd)                        // IN
+{
+   std::string target = mimeType;
+   std::string data;
+   void *buf;
+   size_t sz;
+
+   g_debug("%s: target %s\n", __FUNCTION__, mimeType);
+
+   if (source != mDataSource || !mInHGDrag) {
+      g_debug("%s: not in drag\n", __FUNCTION__);
+      close(fd);
+      return;
+   }
+
+   if (   target == DRAG_TARGET_NAME_URI_LIST
+       && CPClipboard_ItemExists(&mClipboard, CPFORMAT_FILELIST)) {
+      data = GetUriList();
+      if (data.empty()) {
+         close(fd);
+         return;
+      }
+      /*
+       * Block before the target can see the paths, so it waits for the
+       * file transfer instead of finding the files missing. See
+       * DnDUIX11::OnGtkDragDataGet.
+       */
+      if (   !mBlockAdded
+          &&  mInHGDrag
+          && (mHGGetFileStatus == DND_FILE_TRANSFER_NOT_STARTED)) {
+         mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
+         AddBlock();
+      } else {
+         g_debug("%s: not calling AddBlock\n", __FUNCTION__);
+      }
+      g_debug("%s: providing uriList [%s]\n", __FUNCTION__, data.c_str());
+   } else if (   IsPlainText(target)
+              && CPClipboard_GetItem(&mClipboard, CPFORMAT_TEXT, &buf, &sz)) {
+      data.assign(static_cast<const char *>(buf), strnlen((const char *)buf, sz));
+      g_debug("%s: providing plain text, size %" FMTSZ "u\n", __FUNCTION__,
+              data.size());
+   } else if (   IsRichText(target)
+              && CPClipboard_GetItem(&mClipboard, CPFORMAT_RTF, &buf, &sz)) {
+      data.assign(static_cast<const char *>(buf), strnlen((const char *)buf, sz));
+      g_debug("%s: providing rtf text, size %" FMTSZ "u\n", __FUNCTION__,
+              data.size());
+   } else {
+      g_debug("%s: no data for %s\n", __FUNCTION__, mimeType);
+      close(fd);
+      return;
+   }
+
+   DnDUIWaylandTransfer *t = new DnDUIWaylandTransfer;
+   t->ui = this;
+   t->fd = fd;
+   t->data = data;
+   t->offset = 0;
+   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+   t->watch = g_unix_fd_add_full(G_PRIORITY_DEFAULT, fd, G_IO_OUT,
+                                 DnDUIWaylandTransfer::OnWritable, t,
+                                 DnDUIWaylandTransfer::Free);
+   mIoWatches.push_back(t->watch);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::GetUriList --
+ *
+ *      text/uri-list for the host's file list, pointing into the vmblock
+ *      file system when it is available so reads wait for the transfer.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+DnDUIWayland::GetUriList()
+{
+   DnDFileList fList;
+   std::string uriList;
+   void *buf;
+   size_t sz;
+
+   std::string stagingDirName = GetLastDirName(mHGStagingDir);
+   if (stagingDirName.empty()) {
+      g_debug("%s: Cannot get staging directory name, stagingDir: %s\n",
+              __FUNCTION__, mHGStagingDir.c_str());
+      return "";
+   }
+
+   if (   !CPClipboard_GetItem(&mClipboard, CPFORMAT_FILELIST, &buf, &sz)
+       || !fList.FromCPClipboard(buf, sz)) {
+      g_debug("%s: Can't get data from clipboard\n", __FUNCTION__);
+      return "";
+   }
+   mTotalFileSize = fList.GetFileSize();
+
+   /* NUL-delimited relative paths. */
+   std::string relPaths = fList.GetRelPathsStr();
+   size_t start = 0;
+   while (start < relPaths.size()) {
+      size_t end = relPaths.find('\0', start);
+      if (end == std::string::npos) {
+         end = relPaths.size();
+      }
+      std::string rel = relPaths.substr(start, end - start);
+      start = end + 1;
+      if (rel.empty()) {
+         continue;
+      }
+
+      std::string path;
+      if (DnD_BlockIsReady(mBlockCtrl)) {
+         path = std::string(mBlockCtrl->blockRoot) + DIRSEPS + stagingDirName +
+                DIRSEPS + rel;
+      } else {
+         /* The staging dir comes with a trailing slash. */
+         path = mHGStagingDir;
+         if (path.empty() || path[path.size() - 1] != DIRSEPC) {
+            path += DIRSEPS;
+         }
+         path += rel;
+      }
+
+      gchar *uri = g_filename_to_uri(path.c_str(), NULL, NULL);
+      if (uri) {
+         uriList += uri;
+         uriList += DND_URI_LIST_POST;
+         g_free(uri);
+      }
+   }
+   return uriList;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSourceAction --
+ *
+ *      The compositor negotiated a DnD action with the current target; pass
+ *      it to the host as feedback.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSourceAction(struct wl_data_source *source,   // IN
+                             uint32 action)                   // IN
+{
+   if (source != mDataSource) {
+      return;
+   }
+   mSourceAction = action;
+   DND_DROPEFFECT effect = ToDropEffect(action);
+   if (effect != mEffect) {
+      mEffect = effect;
+      g_debug("%s: Updating feedback\n", __FUNCTION__);
+      SourceUpdateFeedback(mEffect);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnSourceEnded --
+ *
+ *      The Wayland drag is over, either taken by a target (finished) or not
+ *      (cancelled). Same handling as GTK+'s "drag_end" in DnDUIX11.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnSourceEnded(struct wl_data_source *source,   // IN
+                            bool finished)                   // IN
+{
+   g_debug("%s: drag %s\n", __FUNCTION__, finished ? "finished" : "cancelled");
+   if (source != mDataSource) {
+      wl_data_source_destroy(source);
+      return;
+   }
+   DestroySource();
+
+   /*
+    * If we are a file DnD and file transfer is not done yet, don't call
+    * ResetUI() here, since we will do so in OnGetFilesDone.
+    */
+   if (DND_FILE_TRANSFER_IN_PROGRESS != mHGGetFileStatus) {
+      ResetUI();
+   }
+   mInHGDrag = false;
+}
+
+
+void
+DnDUIWayland::DestroySource()
+{
+   if (mDataSource) {
+      wl_data_source_destroy(mDataSource);
+      mDataSource = NULL;
+      Flush();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnGetFilesDone --
+ *
+ *      Callback when HG file transfer completes.
+ *
+ * Side effects:
+ *      Releases vmblock blocking entry.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnGetFilesDone(bool success)  // IN: true if transfer succeeded
+{
+   g_debug("%s: %s\n", __FUNCTION__, success ? "success" : "failed");
+
+   mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+
+   if (!mInHGDrag) {
+      ResetUI();
+   } else {
+      RemoveBlock();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnUpdateDetWnd --
+ *
+ *      Callback to show/hide the detection surface. When shown, the pointer
+ *      is wiggled onto it, which is what pulls a guest drag over it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnUpdateDetWnd(bool show,     // IN: show (true) or hide (false)
+                             int32 x,       // IN: destination x-coord
+                             int32 y)       // IN: destination y-coord
+{
+   g_debug("%s: show %d x %d y %d\n", __FUNCTION__, show, x, y);
+
+   if (show) {
+      x = MAX(x / mScale - DRAG_DET_WINDOW_WIDTH / 2, 0);
+      y = MAX(y / mScale - DRAG_DET_WINDOW_WIDTH / 2, 0);
+      ShowDetWnd(x, y);
+      /*
+       * Wiggle the mouse here. Especially for G->H DnD, this improves
+       * reliability of making the drag escape the guest window immensly.
+       */
+      FakeMove(mDetWndX + 2, mDetWndY + 2);
+   } else {
+      HideDetWnd();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnDestMoveDetWndToMousePos --
+ *
+ *      Callback to move detection window to the current mouse position.
+ *      Wayland doesn't tell clients where the pointer is, so this uses the
+ *      last position the host gave us.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnDestMoveDetWndToMousePos()
+{
+   ShowDetWnd(mMousePosX - DRAG_DET_WINDOW_WIDTH / 2,
+              mMousePosY - DRAG_DET_WINDOW_WIDTH / 2);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnMoveMouse --
+ *
+ *      Callback to update mouse position.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnMoveMouse(int32 x,  // IN: Pointer x-coord
+                          int32 y)  // IN: Pointer y-coord
+{
+   mMousePosX = x / mScale;
+   mMousePosY = y / mScale;
+   FakeMove(mMousePosX, mMousePosY);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnPrivateDrop --
+ *
+ *      Handler for private drop event.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnPrivateDrop(int32 x,        // UNUSED
+                            int32 y)        // UNUSED
+{
+   TRACE_CALL();
+
+   if (mGHDnDInProgress) {
+      FakeButton(false);
+   }
+   ResetUI();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnDestCancel --
+ *
+ *      Handler for GH drag cancellation.
+ *
+ *      Note: This event fires as part of the complete guest-to-host sequence,
+ *      not just error or user cancellation. The host has taken the drag over,
+ *      so end the guest drag on the detection surface.
+ *
+ *      The button holding the guest drag belongs to the VM's own pointer, not
+ *      the uinput one, and the kernel drops a release for a button that is
+ *      already up. A press and release on the uinput pointer instead goes
+ *      through, and compositors that track buttons per seat end the drag on
+ *      that release.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnDestCancel()
+{
+   TRACE_CALL();
+
+   if (mGHDnDInProgress) {
+      ShowDetWnd(mDetWndX, mDetWndY);
+      FakeMove(mDetWndX + DET_WND_SIZE / 2, mDetWndY + DET_WND_SIZE / 2);
+      FakeButton(true);
+      FakeButton(false);
+   }
+   mDestDropTime = GetTimeInMillis();
+   ResetUI();
+}
+
+
+/*
+ ****************************************************************************
+ * BEGIN Wayland data device callbacks (dndcp as drag destination: guest-to-host)
+ */
+
+
+void
+DnDUIWayland::OnDataOffer(struct wl_data_offer *offer)   // IN
+{
+   /*
+    * A new offer comes before the enter or selection event that uses it;
+    * its MIME types and source actions arrive in between.
+    */
+   if (mPendingOffer) {
+      wl_data_offer_destroy(mPendingOffer);
+   }
+   mPendingOffer = offer;
+   mPendingOfferMimeTypes.clear();
+   mPendingOfferActions = 0;
+   wl_data_offer_add_listener(offer, &sOfferListener, this);
+}
+
+
+void
+DnDUIWayland::OnSelectionOffer(struct wl_data_offer *offer)   // IN
+{
+   /*
+    * A selection offer is also introduced by data_offer; it isn't ours to
+    * keep. Clipboard is handled by the copy/paste UI.
+    */
+   if (offer == NULL) {
+      return;
+   }
+   if (offer == mPendingOffer) {
+      mPendingOffer = NULL;
+   }
+   wl_data_offer_destroy(offer);
+}
+
+
+void
+DnDUIWayland::OnOfferMimeType(struct wl_data_offer *offer,   // IN
+                              const char *mimeType)          // IN
+{
+   if (offer == mPendingOffer) {
+      mPendingOfferMimeTypes.push_back(mimeType);
+   } else if (offer == mOffer) {
+      mOfferMimeTypes.push_back(mimeType);
+   }
+}
+
+
+void
+DnDUIWayland::OnOfferSourceActions(struct wl_data_offer *offer,   // IN
+                                   uint32 actions)                // IN
+{
+   if (offer == mPendingOffer) {
+      mPendingOfferActions = actions;
+   } else if (offer == mOffer) {
+      mOfferActions = actions;
+   }
+}
+
+
+void
+DnDUIWayland::DestroyOffer()
+{
+   if (mOffer) {
+      wl_data_offer_destroy(mOffer);
+      mOffer = NULL;
+   }
+   mOfferMimeTypes.clear();
+   mOfferActions = 0;
+   mOfferAcceptedMimeType.clear();
+   mOfferAction = 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnDeviceEnter --
+ *
+ *      A drag entered a surface of ours. Like DnDUIX11::OnGtkDragMotion, a
+ *      new guest drag over the detection surface starts a GH DnD: accept
+ *      it and fetch its data for the host.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnDeviceEnter(uint32 serial,                 // IN
+                            struct wl_surface *surface,    // IN
+                            struct wl_data_offer *offer)   // IN
+{
+   DestroyOffer();
+   if (offer != NULL && offer == mPendingOffer) {
+      mOffer = mPendingOffer;
+      mOfferMimeTypes = mPendingOfferMimeTypes;
+      mOfferActions = mPendingOfferActions;
+      mPendingOffer = NULL;
+   } else if (offer != NULL) {
+      /* Shouldn't happen: every offer is introduced by data_offer first. */
+      mOffer = offer;
+   }
+
+   if (surface != mSurface || mOffer == NULL) {
+      return;
+   }
+
+   std::string mimes;
+   for (size_t i = 0; i < mOfferMimeTypes.size(); i++) {
+      mimes += (i ? ", " : "") + mOfferMimeTypes[i];
+   }
+   g_debug("%s: drag entered, offer %p types [%s] actions 0x%x\n",
+           __FUNCTION__, mOffer, mimes.c_str(), mOfferActions);
+
+   unsigned long curTime = GetTimeInMillis();
+   if (curTime - mDestDropTime <= 1000) {
+      g_debug("%s: ignored %ld %ld %ld\n", __FUNCTION__,
+              curTime, mDestDropTime, curTime - mDestDropTime);
+      return;
+   }
+
+   if (mInHGDrag || (mHGGetFileStatus != DND_FILE_TRANSFER_NOT_STARTED)) {
+      g_debug("%s: ignored, in hg drag or getting hg data\n", __FUNCTION__);
+      return;
+   }
+
+   if (!mDnD->IsDnDAllowed()) {
+      g_debug("%s: No dnd allowed!\n", __FUNCTION__);
+      wl_data_offer_accept(mOffer, serial, NULL);
+      return;
+   }
+
+   /* Check if dnd began from this vm. */
+   char *pid = Str_Asprintf(NULL, GUEST_DND_TARGET_FMT,
+                            static_cast<int>(getpid()));
+   bool reentrant =
+      pid != NULL &&
+      std::find(mOfferMimeTypes.begin(), mOfferMimeTypes.end(),
+                std::string(pid)) != mOfferMimeTypes.end();
+   free(pid);
+   if (reentrant) {
+      g_debug("%s: found re-entrant drop target\n", __FUNCTION__);
+      wl_data_offer_accept(mOffer, serial, NULL);
+      return;
+   }
+
+   /*
+    * Only ever accept a copy. With move, the source would delete the data
+    * once we finish, and we only pass a reference on to the host.
+    */
+   if (!(mOfferActions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)) {
+      g_debug("%s: Invalid drag, source can't copy\n", __FUNCTION__);
+      wl_data_offer_accept(mOffer, serial, NULL);
+      return;
+   }
+
+   if (!mGHDnDInProgress) {
+      g_debug("%s: new drag, need to get data for host\n", __FUNCTION__);
+      mGHDnDInProgress = true;
+      if (!RequestData()) {
+         g_debug("%s: RequestData failed.\n", __FUNCTION__);
+         mGHDnDInProgress = false;
+         wl_data_offer_accept(mOffer, serial, NULL);
+         return;
+      }
+   } else {
+      g_debug("%s: re-entered before gh data has been received.\n",
+              __FUNCTION__);
+   }
+
+   wl_data_offer_accept(mOffer, serial, mOfferAcceptedMimeType.c_str());
+   wl_data_offer_set_actions(mOffer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                             WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+   mOfferAction = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+   Flush();
+}
+
+
+void
+DnDUIWayland::OnDeviceLeave()
+{
+   g_debug("%s: drag left\n", __FUNCTION__);
+   /* The offer is dead once the drag leaves; transfers already started
+    * finish on their own pipes. */
+   DestroyOffer();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnDeviceDrop --
+ *
+ *      The guest drag was dropped on the detection surface, normally by our
+ *      own button release in OnDestCancel. Like DnDUIX11::OnGtkDragDrop,
+ *      just finish it; the host has the data already.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnDeviceDrop()
+{
+   g_debug("%s: drop, offer %p accepted %s action %u\n", __FUNCTION__,
+           mOffer, mOfferAcceptedMimeType.c_str(), mOfferAction);
+
+   if (   mOffer
+       && !mOfferAcceptedMimeType.empty()
+       && mOfferAction == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY) {
+      wl_data_offer_finish(mOffer);
+   }
+   DestroyOffer();
+   Flush();
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::RequestData --
+ *
+ *      Pick the formats we support from the offer and start reading them.
+ *      A file list wins over everything else; otherwise plain text and RTF
+ *      are both read. Sets mOfferAcceptedMimeType to the format to accept.
+ *
+ * Results:
+ *      Returns true if we found a supported type.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::RequestData()
+{
+   static const char *const textTypes[] = {
+      TARGET_NAME_TEXT_PLAIN_UTF8, TARGET_NAME_UTF8_STRING,
+      TARGET_NAME_TEXT_PLAIN, TARGET_NAME_STRING, NULL,
+   };
+   static const char *const rtfTypes[] = {
+      TARGET_NAME_TEXT_RTF, TARGET_NAME_APPLICATION_RTF,
+      TARGET_NAME_TEXT_RICHTEXT, NULL,
+   };
+   std::vector<std::string> wanted;
+
+   CPClipboard_Clear(&mClipboard);
+   mNumPendingRequest = 0;
+   mOfferAcceptedMimeType.clear();
+
+#define OFFERED(_t) \
+   (std::find(mOfferMimeTypes.begin(), mOfferMimeTypes.end(), \
+              std::string(_t)) != mOfferMimeTypes.end())
+
+   if (OFFERED(DRAG_TARGET_NAME_URI_LIST)) {
+      wanted.push_back(DRAG_TARGET_NAME_URI_LIST);
+   } else {
+      for (int i = 0; textTypes[i]; i++) {
+         if (OFFERED(textTypes[i])) {
+            wanted.push_back(textTypes[i]);
+            break;
+         }
+      }
+      for (int i = 0; rtfTypes[i]; i++) {
+         if (OFFERED(rtfTypes[i])) {
+            wanted.push_back(rtfTypes[i]);
+            break;
+         }
+      }
+   }
+
+#undef OFFERED
+
+   for (size_t i = 0; i < wanted.size(); i++) {
+      int fds[2];
+
+      if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) {
+         g_debug("%s: pipe failed: %s\n", __FUNCTION__, strerror(errno));
+         continue;
+      }
+      wl_data_offer_receive(mOffer, wanted[i].c_str(), fds[1]);
+      close(fds[1]);
+
+      DnDUIWaylandTransfer *t = new DnDUIWaylandTransfer;
+      t->ui = this;
+      t->fd = fds[0];
+      t->mimeType = wanted[i];
+      t->offset = 0;
+      t->watch = g_unix_fd_add_full(G_PRIORITY_DEFAULT, fds[0],
+                                    (GIOCondition)(G_IO_IN | G_IO_HUP |
+                                                   G_IO_ERR),
+                                    DnDUIWaylandTransfer::OnReadable, t,
+                                    DnDUIWaylandTransfer::Free);
+      mIoWatches.push_back(t->watch);
+      mNumPendingRequest++;
+      if (mOfferAcceptedMimeType.empty()) {
+         mOfferAcceptedMimeType = wanted[i];
+      }
+   }
+   Flush();
+   return mNumPendingRequest > 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::OnReceiveDone --
+ *
+ *      One requested format has been read, like GTK+'s
+ *      "drag_data_received". Once all are in, tell the host a drag is
+ *      leaving the guest.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+DnDUIWayland::OnReceiveDone(const std::string &mimeType,   // IN
+                            const std::string &data)       // IN
+{
+   g_debug("%s: got %" FMTSZ "u bytes of %s\n", __FUNCTION__, data.size(),
+           mimeType.c_str());
+
+   /* The GH DnD may already finish before we got response. */
+   if (!mGHDnDInProgress) {
+      g_debug("%s: not valid\n", __FUNCTION__);
+      return;
+   }
+
+   if (!SetCPClipboardFromData(mimeType, data)) {
+      g_debug("%s: Failed to set CP clipboard.\n", __FUNCTION__);
+      ResetUI();
+      return;
+   }
+
+   mNumPendingRequest--;
+   if (mNumPendingRequest > 0) {
+      return;
+   }
+
+   if (CPClipboard_IsEmpty(&mClipboard)) {
+      g_debug("%s: Failed getting item.\n", __FUNCTION__);
+      ResetUI();
+      return;
+   }
+
+   if (!mGHDnDDataReceived) {
+      g_debug("%s: Drag entering.\n", __FUNCTION__);
+      mGHDnDDataReceived = true;
+      TargetDragEnter();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::SetCPClipboardFromData --
+ *
+ *      Construct cross-platform clipboard from data read from an offer.
+ *      Same conversions as DnDUIX11::SetCPClipboardFromGtk.
+ *
+ * Results:
+ *      Returns true if conversion succeeded, false otherwise.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+DnDUIWayland::SetCPClipboardFromData(const std::string &mimeType,   // IN
+                                     const std::string &data)       // IN
+{
+   /* Try to get file list. */
+   if (   mDnD->CheckCapability(DND_CP_CAP_FILE_DND)
+       && mimeType == DRAG_TARGET_NAME_URI_LIST) {
+      DnDFileList fileList;
+      DynBuf buf;
+      uint64 totalSize = 0;
+      int64 size;
+      std::string source = data;
+      size_t index = 0;
+      char *newPath;
+      size_t newPathLen;
+
+      g_debug("%s: Got file list: [%s]\n", __FUNCTION__, source.c_str());
+
+      if (source.empty()) {
+         g_debug("%s: empty file list!\n", __FUNCTION__);
+         return false;
+      }
+
+      /*
+       * In gnome, before file list there may be a extra line indicating it
+       * is a copy or cut.
+       */
+      if (source.compare(0, 5, "copy\n") == 0) {
+         source.erase(0, 5);
+      }
+      if (source.compare(0, 4, "cut\n") == 0) {
+         source.erase(0, 4);
+      }
+      while (source.length() > 0 &&
+             (source[0] == '\n' || source[0] == '\r' || source[0] == ' ')) {
+         source.erase(0, 1);
+      }
+
+      while ((newPath = DnD_UriListGetNextFile(source.c_str(),
+                                               &index,
+                                               &newPathLen)) != NULL) {
+         char *newRelPath;
+
+         if (DnD_UriIsNonFileSchemes(newPath)) {
+            /* Try to get local file path for non file uri. */
+            GFile *file = g_file_new_for_uri(newPath);
+            free(newPath);
+            if (!file) {
+               g_debug("%s: g_file_new_for_uri failed\n", __FUNCTION__);
+               return false;
+            }
+            newPath = g_file_get_path(file);
+            g_object_unref(file);
+            if (!newPath) {
+               g_debug("%s: g_file_get_path failed\n", __FUNCTION__);
+               return false;
+            }
+         }
+
+         newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1;
+
+         /* Keep track of how big the dnd files are. */
+         if ((size = File_GetSizeEx(newPath)) >= 0) {
+            totalSize += size;
+         } else {
+            g_debug("%s: unable to get file size for %s\n", __FUNCTION__,
+                    newPath);
+         }
+         g_debug("%s: Adding newPath '%s' newRelPath '%s'\n", __FUNCTION__,
+                 newPath, newRelPath);
+         fileList.AddFile(newPath, newRelPath);
+         char *newUri = HgfsUri_ConvertFromPathToHgfsUri(newPath, false);
+         fileList.AddFileUri(newUri);
+         free(newUri);
+         free(newPath);
+      }
+
+      DynBuf_Init(&buf);
+      fileList.SetFileSize(totalSize);
+      if (fileList.ToCPClipboard(&buf, false)) {
+         CPClipboard_SetItem(&mClipboard, CPFORMAT_FILELIST, DynBuf_Get(&buf),
+                             DynBuf_GetSize(&buf));
+      }
+      DynBuf_Destroy(&buf);
+      if (fileList.ToUriClipboard(&buf)) {
+         CPClipboard_SetItem(&mClipboard, CPFORMAT_FILELIST_URI,
+                             DynBuf_Get(&buf), DynBuf_GetSize(&buf));
+      }
+      DynBuf_Destroy(&buf);
+      return true;
+   }
+
+   /* Try to get plain text. */
+   if (   mDnD->CheckCapability(DND_CP_CAP_PLAIN_TEXT_DND)
+       && IsPlainText(mimeType)) {
+      if (   data.size() > 0
+          && data.size() < DNDMSG_MAX_ARGSZ
+          && CPClipboard_SetItem(&mClipboard, CPFORMAT_TEXT, data.c_str(),
+                                 data.size() + 1)) {
+         g_debug("%s: Got text, size %" FMTSZ "u\n", __FUNCTION__, data.size());
+         return true;
+      }
+      g_debug("%s: Failed to get text\n", __FUNCTION__);
+      return false;
+   }
+
+   /* Try to get RTF string. */
+   if (   mDnD->CheckCapability(DND_CP_CAP_RTF_DND)
+       && IsRichText(mimeType)) {
+      if (   data.size() > 0
+          && data.size() < DNDMSG_MAX_ARGSZ
+          && CPClipboard_SetItem(&mClipboard, CPFORMAT_RTF, data.c_str(),
+                                 data.size() + 1)) {
+         g_debug("%s: Got RTF, size %" FMTSZ "u\n", __FUNCTION__, data.size());
+         return true;
+      }
+      g_debug("%s: Failed to get RTF\n", __FUNCTION__);
+      return false;
+   }
+   return true;
+}
+
+
+/*
+ * END Wayland data device callbacks (dndcp as drag destination: guest-to-host)
+ ****************************************************************************
+ */
+
+
+void
+DnDUIWayland::TargetDragEnter()
+{
+   TRACE_CALL();
+
+   /* Check if there is valid data with current detection window. */
+   if (!CPClipboard_IsEmpty(&mClipboard)) {
+      g_debug("%s: got valid data from detWnd.\n", __FUNCTION__);
+      mDnD->DestUIDragEnter(&mClipboard);
+   }
+}
+
+
+void
+DnDUIWayland::SourceDragStartDone()
+{
+   TRACE_CALL();
+   mInHGDrag = true;
+   mDnD->SrcUIDragBeginDone();
+}
+
+
+void
+DnDUIWayland::SourceUpdateFeedback(
+   DND_DROPEFFECT effect) // IN: feedback to send to the UI-independent DnD layer.
+{
+   TRACE_CALL();
+   mDnD->SrcUIUpdateFeedback(effect);
+}
+
+
+void
+DnDUIWayland::AddBlock()
+{
+   TRACE_CALL();
+   if (mBlockAdded) {
+      g_debug("%s: block already added\n", __FUNCTION__);
+      return;
+   }
+   if (   DnD_BlockIsReady(mBlockCtrl)
+       && mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str())) {
+      mBlockAdded = true;
+      g_debug("%s: add block for %s.\n", __FUNCTION__, mHGStagingDir.c_str());
+   } else {
+      mBlockAdded = false;
+      g_debug("%s: unable to add block dir %s.\n", __FUNCTION__,
+              mHGStagingDir.c_str());
+   }
+}
+
+
+void
+DnDUIWayland::RemoveBlock()
+{
+   TRACE_CALL();
+   if (mBlockAdded && (DND_FILE_TRANSFER_IN_PROGRESS != mHGGetFileStatus)) {
+      g_debug("%s: removing block for %s\n", __FUNCTION__,
+              mHGStagingDir.c_str());
+      /* We need to make sure block subsystem has not been shut off. */
+      if (DnD_BlockIsReady(mBlockCtrl)) {
+         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+      }
+      mBlockAdded = false;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * DnDUIWayland::GetLastDirName --
+ *
+ *      The basename of a staging directory, e.g. /tmp/VMwareDnD/abcd137 →
+ *      abcd137. See DnDUIX11::GetLastDirName.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+DnDUIWayland::GetLastDirName(const std::string &str)
+{
+   char *baseName;
+   std::string stripSlash = str;
+   char *path = File_StripSlashes(stripSlash.c_str());
+   if (path) {
+      stripSlash = path;
+      free(path);
+   }
+
+   File_GetPathName(stripSlash.c_str(), NULL, &baseName);
+   if (baseName) {
+      std::string s(baseName);
+      free(baseName);
+      return s;
+   }
+   return std::string();
+}
+
+
+/* static */ DND_DROPEFFECT
+DnDUIWayland::ToDropEffect(uint32 action)
+{
+   switch (action) {
+   case WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY:
+      return DROP_COPY;
+   case WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE:
+      return DROP_MOVE;
+   case WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE:
+      return DROP_NONE;
+   default:
+      return DROP_UNKNOWN;
+   }
+}
+
+
+/* static */ unsigned long
+DnDUIWayland::GetTimeInMillis()
+{
+   struct timeval tv;
+
+   gettimeofday(&tv, NULL);
+   return tv.tv_sec * 1000UL + tv.tv_usec / 1000;
+}
+
+
+/* static */ bool
+DnDUIWayland::IsPlainText(const std::string &mimeType)
+{
+   return    mimeType == TARGET_NAME_TEXT_PLAIN_UTF8
+          || mimeType == TARGET_NAME_UTF8_STRING
+          || mimeType == TARGET_NAME_TEXT_PLAIN
+          || mimeType == TARGET_NAME_STRING;
+}
+
+
+/* static */ bool
+DnDUIWayland::IsRichText(const std::string &mimeType)
+{
+   return    mimeType == TARGET_NAME_TEXT_RTF
+          || mimeType == TARGET_NAME_APPLICATION_RTF
+          || mimeType == TARGET_NAME_TEXT_RICHTEXT;
+}
