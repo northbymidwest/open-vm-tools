@@ -56,7 +56,6 @@
 
 #include <algorithm>
 
-#include <glib-unix.h>
 #include <gio/gio.h>
 #include <wayland-client.h>
 
@@ -67,6 +66,7 @@
 #include "viewporter-client-protocol.h"
 
 #include "dndUIWayland.h"
+#include "waylandUtil.h"
 #include "guestDnDCPMgr.hh"
 #include "tracer.hh"
 #include "fakeMouseWayland/fakeMouseWayland.h"
@@ -386,167 +386,6 @@ InitListeners()
 /*
  *-----------------------------------------------------------------------------
  *
- * Wayland GSource --
- *
- *      Dispatches the Wayland connection from vmusr's GLib main loop.
- *
- *-----------------------------------------------------------------------------
- */
-
-struct WaylandSource {
-   GSource source;
-   struct wl_display *display;
-   gpointer fdTag;
-};
-
-
-static gboolean
-WaylandSourcePrepare(GSource *base,
-                     gint *timeout)
-{
-   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
-
-   *timeout = -1;
-   wl_display_dispatch_pending(src->display);
-   wl_display_flush(src->display);
-   return FALSE;
-}
-
-
-static gboolean
-WaylandSourceCheck(GSource *base)
-{
-   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
-
-   return g_source_query_unix_fd(base, src->fdTag) != 0;
-}
-
-
-static gboolean
-WaylandSourceDispatch(GSource *base,
-                      GSourceFunc callback,
-                      gpointer data)
-{
-   WaylandSource *src = reinterpret_cast<WaylandSource *>(base);
-   GIOCondition cond = g_source_query_unix_fd(base, src->fdTag);
-
-   if (cond & (G_IO_ERR | G_IO_HUP)) {
-      g_warning("%s: lost the Wayland connection\n", __FUNCTION__);
-      return G_SOURCE_REMOVE;
-   }
-   if ((cond & G_IO_IN) && wl_display_dispatch(src->display) < 0) {
-      g_warning("%s: wl_display_dispatch failed: %s\n", __FUNCTION__,
-                strerror(errno));
-      return G_SOURCE_REMOVE;
-   }
-   return G_SOURCE_CONTINUE;
-}
-
-
-static GSourceFuncs sWaylandSourceFuncs = {
-   WaylandSourcePrepare,
-   WaylandSourceCheck,
-   WaylandSourceDispatch,
-   NULL,
-};
-
-
-/*
- *-----------------------------------------------------------------------------
- *
- * DnDUIWaylandTransfer --
- *
- *      One in-flight read (guest-to-host offer data) or write (host-to-guest
- *      source data) on a pipe, driven by a GLib fd watch so a slow peer
- *      can't block vmusr's main loop.
- *
- *-----------------------------------------------------------------------------
- */
-
-struct DnDUIWaylandTransfer {
-   DnDUIWayland *ui;
-   int fd;
-   guint watch;
-   std::string mimeType;
-   std::string data;
-   size_t offset;
-
-   static gboolean OnReadable(gint fd, GIOCondition cond, gpointer data);
-   static gboolean OnWritable(gint fd, GIOCondition cond, gpointer data);
-   static void Free(gpointer data);
-   void Unwatch();
-};
-
-
-void
-DnDUIWaylandTransfer::Unwatch()
-{
-   std::vector<guint> &w = ui->mIoWatches;
-   w.erase(std::remove(w.begin(), w.end(), watch), w.end());
-}
-
-
-void
-DnDUIWaylandTransfer::Free(gpointer data)
-{
-   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
-
-   close(t->fd);
-   delete t;
-}
-
-
-gboolean
-DnDUIWaylandTransfer::OnReadable(gint fd,
-                                 GIOCondition cond,
-                                 gpointer data)
-{
-   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
-   char buf[4096];
-   ssize_t n;
-
-   while ((n = read(fd, buf, sizeof buf)) > 0) {
-      t->data.append(buf, n);
-   }
-   if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
-      return G_SOURCE_CONTINUE;
-   }
-   if (n < 0) {
-      g_debug("%s: read failed: %s\n", __FUNCTION__, strerror(errno));
-   }
-   t->Unwatch();
-   t->ui->OnReceiveDone(t->mimeType, t->data);
-   return G_SOURCE_REMOVE;
-}
-
-
-gboolean
-DnDUIWaylandTransfer::OnWritable(gint fd,
-                                 GIOCondition cond,
-                                 gpointer data)
-{
-   DnDUIWaylandTransfer *t = static_cast<DnDUIWaylandTransfer *>(data);
-
-   while (t->offset < t->data.size()) {
-      ssize_t n = write(fd, t->data.data() + t->offset,
-                        t->data.size() - t->offset);
-      if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
-         return G_SOURCE_CONTINUE;
-      }
-      if (n < 0) {
-         g_debug("%s: write failed: %s\n", __FUNCTION__, strerror(errno));
-         break;
-      }
-      t->offset += n;
-   }
-   t->Unwatch();
-   return G_SOURCE_REMOVE;
-}
-
-
-/*
- *-----------------------------------------------------------------------------
- *
  * DnDUIWayland::DnDUIWayland --
  *
  *      Constructor.
@@ -641,11 +480,7 @@ DnDUIWayland::~DnDUIWayland()
    ResetUI();
    ReleaseHeldButton();
 
-   while (!mIoWatches.empty()) {
-      guint watch = mIoWatches.back();
-      mIoWatches.pop_back();
-      g_source_remove(watch);
-   }
+   mTransfers.CancelAll();
    Disconnect();
    if (mUseUInput) {
       FakeMouse_Destory();
@@ -671,15 +506,7 @@ DnDUIWayland::~DnDUIWayland()
 /* static */ bool
 DnDUIWayland::IsSupported()
 {
-   const char *forced = getenv("VMTOOLS_DND_BACKEND");
-   const char *sessionType = getenv("XDG_SESSION_TYPE");
-
-   if (forced != NULL && strcmp(forced, "x11") == 0) {
-      g_debug("%s: X11 forced by VMTOOLS_DND_BACKEND\n", __FUNCTION__);
-      return false;
-   }
-   if (   (forced == NULL || strcmp(forced, "wayland") != 0)
-       && (sessionType == NULL || strcmp(sessionType, "wayland") != 0)) {
+   if (!WaylandUtil_IsWaylandSession("VMTOOLS_DND_BACKEND")) {
       return false;
    }
 
@@ -840,15 +667,7 @@ DnDUIWayland::Connect()
                                                         mSeat);
    wl_data_device_add_listener(mDataDevice, &sDeviceListener, this);
 
-   WaylandSource *src = reinterpret_cast<WaylandSource *>(
-      g_source_new(&sWaylandSourceFuncs, sizeof(WaylandSource)));
-   src->display = mDisplay;
-   src->fdTag = g_source_add_unix_fd(&src->source,
-                                     wl_display_get_fd(mDisplay),
-                                     (GIOCondition)(G_IO_IN | G_IO_ERR |
-                                                    G_IO_HUP));
-   g_source_attach(&src->source, NULL);
-   mSource = &src->source;
+   mSource = WaylandUtil_CreateSource(mDisplay);
    return true;
 }
 
@@ -1612,16 +1431,7 @@ DnDUIWayland::OnSourceSend(struct wl_data_source *source,   // IN
       return;
    }
 
-   DnDUIWaylandTransfer *t = new DnDUIWaylandTransfer;
-   t->ui = this;
-   t->fd = fd;
-   t->data = data;
-   t->offset = 0;
-   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-   t->watch = g_unix_fd_add_full(G_PRIORITY_DEFAULT, fd, G_IO_OUT,
-                                 DnDUIWaylandTransfer::OnWritable, t,
-                                 DnDUIWaylandTransfer::Free);
-   mIoWatches.push_back(t->watch);
+   mTransfers.Write(fd, data);
 }
 
 
@@ -2270,17 +2080,10 @@ DnDUIWayland::RequestData()
       wl_data_offer_receive(mOffer, wanted[i].c_str(), fds[1]);
       close(fds[1]);
 
-      DnDUIWaylandTransfer *t = new DnDUIWaylandTransfer;
-      t->ui = this;
-      t->fd = fds[0];
-      t->mimeType = wanted[i];
-      t->offset = 0;
-      t->watch = g_unix_fd_add_full(G_PRIORITY_DEFAULT, fds[0],
-                                    (GIOCondition)(G_IO_IN | G_IO_HUP |
-                                                   G_IO_ERR),
-                                    DnDUIWaylandTransfer::OnReadable, t,
-                                    DnDUIWaylandTransfer::Free);
-      mIoWatches.push_back(t->watch);
+      mTransfers.Read(fds[0],
+                      sigc::bind(sigc::mem_fun(this,
+                                               &DnDUIWayland::OnReceiveDone),
+                                 wanted[i]));
       mNumPendingRequest++;
       if (mOfferAcceptedMimeType.empty()) {
          mOfferAcceptedMimeType = wanted[i];
@@ -2304,8 +2107,8 @@ DnDUIWayland::RequestData()
  */
 
 void
-DnDUIWayland::OnReceiveDone(const std::string &mimeType,   // IN
-                            const std::string &data)       // IN
+DnDUIWayland::OnReceiveDone(const std::string &data,   // IN
+                            std::string mimeType)      // IN
 {
    g_debug("%s: got %" FMTSZ "u bytes of %s\n", __FUNCTION__, data.size(),
            mimeType.c_str());

@@ -43,6 +43,7 @@ extern "C" {
 #include "posix.h"
 #include "unicodeOperations.h"
 #include "guestCopyPaste.hh"
+#include "copyPasteUI.h"
 
 /*
  * Make sure exception types are public and therefore shared between libg*mm
@@ -80,7 +81,8 @@ struct ThreadParams
    utf::string fileBlockName;
 };
 
-class CopyPasteUIX11 : public sigc::trackable
+class CopyPasteUIX11 : public CopyPasteUI,
+                       public sigc::trackable
 {
 public:
    CopyPasteUIX11();

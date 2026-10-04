@@ -29,6 +29,7 @@
 #include "copyPasteDnDX11.h"
 #ifdef HAVE_WAYLAND_DND
 #include "dndUIWayland.h"
+#include "copyPasteUIWayland.h"
 #endif
 #include "copyPasteUIX11.h"
 #include "tracer.hh"
@@ -326,27 +327,45 @@ CopyPasteDnDX11::RegisterCP()
       return FALSE;
    }
 
-   m_copyPasteUI = new CopyPasteUIX11();
-   if (m_copyPasteUI) {
-      if (m_copyPasteUI->Init()) {
-         BlockService *bs = BlockService::GetInstance();
-         m_copyPasteUI->SetBlockControl(bs->GetBlockCtrl());
-         wrapper->SetCPIsRegistered(TRUE);
-         int version = wrapper->GetCPVersion();
-         g_debug("%s: version is %d\n", __FUNCTION__, version);
-
-         if (version >= 3) {
-            CopyPasteVersionChanged(version);
-            m_copyPasteUI->SetCopyPasteAllowed(TRUE);
-         }
-         /*
-          * Set legacy copy/paste version.
-          */
-         CopyPaste_SetVersion(version);
-      } else {
+#ifdef HAVE_WAYLAND_DND
+   /*
+    * Prefer native Wayland copy/paste where the compositor supports it; the
+    * X11 clipboard through Xwayland relies on the compositor syncing the
+    * Wayland clipboard to X11, which KWin only does for focused X11 windows.
+    */
+   if (CopyPasteUIWayland::IsSupported()) {
+      m_copyPasteUI = new CopyPasteUIWayland();
+      if (!m_copyPasteUI->Init()) {
+         g_debug("%s: native Wayland copy/paste unavailable, using X11\n",
+                 __FUNCTION__);
          delete m_copyPasteUI;
          m_copyPasteUI = nullptr;
       }
+   }
+   if (!m_copyPasteUI)
+#endif
+   {
+      m_copyPasteUI = new CopyPasteUIX11();
+      if (!m_copyPasteUI->Init()) {
+         delete m_copyPasteUI;
+         m_copyPasteUI = nullptr;
+      }
+   }
+   if (m_copyPasteUI) {
+      BlockService *bs = BlockService::GetInstance();
+      m_copyPasteUI->SetBlockControl(bs->GetBlockCtrl());
+      wrapper->SetCPIsRegistered(TRUE);
+      int version = wrapper->GetCPVersion();
+      g_debug("%s: version is %d\n", __FUNCTION__, version);
+
+      if (version >= 3) {
+         CopyPasteVersionChanged(version);
+         m_copyPasteUI->SetCopyPasteAllowed(TRUE);
+      }
+      /*
+       * Set legacy copy/paste version.
+       */
+      CopyPaste_SetVersion(version);
    }
    return wrapper->IsCPRegistered();
 }

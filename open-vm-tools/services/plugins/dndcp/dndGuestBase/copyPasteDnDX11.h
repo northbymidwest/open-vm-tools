@@ -39,7 +39,7 @@
 #include "vm_basic_types.h"
 #include "copyPasteDnDImpl.h"
 
-class CopyPasteUIX11;
+#include "copyPasteUI.h"
 
 class CopyPasteDnDX11 : public CopyPasteDnDImpl
 {
@@ -58,7 +58,7 @@ public:
    void SetDnDAllowed(bool allowed);
    void SetCopyPasteAllowed(bool allowed);
 private:
-   CopyPasteUIX11 *m_copyPasteUI;
+   CopyPasteUI *m_copyPasteUI;
    DnDUI *m_dndUI;
 #if defined(GTK3)
    Gtk::Main *m_main;

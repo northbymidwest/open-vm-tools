@@ -46,6 +46,7 @@
 #include "stringxx/string.hh"
 #include "dnd.h"
 #include "dndUI.h"
+#include "waylandUtil.h"
 
 extern "C" {
 #include "dndClipboard.h"
@@ -112,7 +113,7 @@ public:
                       struct wl_data_offer *offer);
    void OnDeviceLeave();
    void OnDeviceDrop();
-   void OnReceiveDone(const std::string &mimeType, const std::string &data);
+   void OnReceiveDone(const std::string &data, std::string mimeType);
 
 private:
    /*
@@ -261,10 +262,8 @@ private:
    /* The uinput button is held to keep a guest drag alive; see OnStateChanged. */
    bool mHoldingButton;
 
-   /* GLib watches for in-flight data transfers, removed on destruction. */
-   std::vector<guint> mIoWatches;
-
-   friend struct DnDUIWaylandTransfer;
+   /* In-flight data transfers, cancelled on destruction. */
+   WaylandTransfers mTransfers;
 };
 
 #endif // __DND_UI_WAYLAND_H__

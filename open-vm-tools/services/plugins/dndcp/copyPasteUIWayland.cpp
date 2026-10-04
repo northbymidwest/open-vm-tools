@@ -1,0 +1,1382 @@
+/*********************************************************
+ * Copyright (c) 2026 Michael Bryniarski.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published
+ * by the Free Software Foundation version 2.1 and no later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the Lesser GNU General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA.
+ *
+ *********************************************************/
+
+/**
+ * @file copyPasteUIWayland.cpp --
+ *
+ *    Native Wayland copy/paste UI. Mirrors CopyPasteUIX11's handling of the
+ *    common copy/paste layer's signals, using ext-data-control-v1 in place
+ *    of the X11 clipboard:
+ *
+ *    - Host-to-guest: the host's clipboard becomes an
+ *      ext_data_control_source_v1 set as the selection. Copied files are
+ *      offered as paths in a vmblock-blocked staging directory, and the
+ *      transfer from the host starts when one of them is first accessed.
+ *
+ *    - Guest-to-host: the device's selection events track the current
+ *      clipboard offer. When the host asks for the guest clipboard, the
+ *      offer's data is read and sent, or "not changed" if no other client
+ *      has set the selection since the last time.
+ */
+
+#define G_LOG_DOMAIN "dndcp"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <algorithm>
+
+#include <gio/gio.h>
+#include <wayland-client.h>
+
+#include "ext-data-control-v1-client-protocol.h"
+
+#include "copyPasteUIWayland.h"
+#include "guestDnDCPMgr.hh"
+#include "tracer.hh"
+#include "dndFileList.hh"
+#include "dynbuf.h"
+#include "file.h"
+#include "str.h"
+#include "util.h"
+#include "vmblock.h"
+
+/* Offered with the host's clipboard so we can recognize our own selection. */
+#define GUEST_CP_OWNER_FMT "application/x-vmware-tools-clipboard-%d"
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * Listener trampolines --
+ *
+ *      Forward libwayland events to the CopyPasteUIWayland passed as user
+ *      data. Filled in at runtime, as in dndUIWayland.cpp.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+#define UI(data) (static_cast<CopyPasteUIWayland *>(data))
+
+static void
+RegistryGlobal(void *data, struct wl_registry *reg, uint32_t name,
+               const char *iface, uint32_t version)
+{
+   UI(data)->OnRegistryGlobal(reg, name, iface, version);
+}
+
+static void
+RegistryGlobalRemove(void *data, struct wl_registry *reg, uint32_t name)
+{
+}
+
+static void
+DeviceDataOffer(void *data, struct ext_data_control_device_v1 *d,
+                struct ext_data_control_offer_v1 *offer)
+{
+   UI(data)->OnDataOffer(offer);
+}
+
+static void
+DeviceSelection(void *data, struct ext_data_control_device_v1 *d,
+                struct ext_data_control_offer_v1 *offer)
+{
+   UI(data)->OnSelection(offer);
+}
+
+static void
+DeviceFinished(void *data, struct ext_data_control_device_v1 *d)
+{
+   UI(data)->OnDeviceFinished();
+}
+
+static void
+DevicePrimarySelection(void *data, struct ext_data_control_device_v1 *d,
+                       struct ext_data_control_offer_v1 *offer)
+{
+   UI(data)->OnPrimarySelection(offer);
+}
+
+static void
+OfferOffer(void *data, struct ext_data_control_offer_v1 *offer,
+           const char *mimeType)
+{
+   UI(data)->OnOfferMimeType(offer, mimeType);
+}
+
+static void
+SourceSend(void *data, struct ext_data_control_source_v1 *source,
+           const char *mimeType, int32_t fd)
+{
+   UI(data)->OnSourceSend(source, mimeType, fd);
+}
+
+static void
+SourceCancelled(void *data, struct ext_data_control_source_v1 *source)
+{
+   UI(data)->OnSourceCancelled(source);
+}
+
+static struct wl_registry_listener sRegistryListener;
+static struct ext_data_control_device_v1_listener sDeviceListener;
+static struct ext_data_control_offer_v1_listener sOfferListener;
+static struct ext_data_control_source_v1_listener sSourceListener;
+
+
+static void
+InitListeners()
+{
+   static bool done = false;
+
+   if (done) {
+      return;
+   }
+   done = true;
+
+   sRegistryListener.global = RegistryGlobal;
+   sRegistryListener.global_remove = RegistryGlobalRemove;
+
+   sDeviceListener.data_offer = DeviceDataOffer;
+   sDeviceListener.selection = DeviceSelection;
+   sDeviceListener.finished = DeviceFinished;
+   sDeviceListener.primary_selection = DevicePrimarySelection;
+
+   sOfferListener.offer = OfferOffer;
+
+   sSourceListener.send = SourceSend;
+   sSourceListener.cancelled = SourceCancelled;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::CopyPasteUIWayland --
+ *
+ *      Constructor.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+CopyPasteUIWayland::CopyPasteUIWayland()
+   : mCP(NULL),
+     mBlockCtrl(NULL),
+     mInited(false),
+     mDisplay(NULL),
+     mRegistry(NULL),
+     mSeat(NULL),
+     mManager(NULL),
+     mDevice(NULL),
+     mSource(NULL),
+     mPendingOffer(NULL),
+     mSelection(NULL),
+     mSelectionSerial(1),
+     mDataSource(NULL),
+     mIsClipboardOwner(false),
+     mTotalFileSize(0),
+     mHGGetFileStatus(DND_FILE_TRANSFER_NOT_STARTED),
+     mBlockAdded(false),
+     mFilesRequested(false),
+     mGHRequest(0),
+     mGHPendingReads(0),
+     mGHRequestSerial(0),
+     mSentSerial(0),
+     mThread(0),
+     mFileBlockCondExit(false),
+     mRequestFilesIdle(0)
+{
+   TRACE_CALL();
+   InitListeners();
+   CPClipboard_Init(&mClipboard);
+
+   GuestDnDCPMgr *p = GuestDnDCPMgr::GetInstance();
+   ASSERT(p);
+   mCP = p->GetCopyPasteMgr();
+   ASSERT(mCP);
+
+   pthread_mutex_init(&mFileBlockMutex, NULL);
+   pthread_cond_init(&mFileBlockCond, NULL);
+   int ret = pthread_create(&mThread, NULL, FileBlockMonitorThread, this);
+   if (ret != 0) {
+      g_warning("%s: Create thread failed, errno:%d.\n", __FUNCTION__, ret);
+      mThread = 0;
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::~CopyPasteUIWayland --
+ *
+ *      Destructor.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+CopyPasteUIWayland::~CopyPasteUIWayland()
+{
+   TRACE_CALL();
+
+   /* Any files from last unfinished file transfer should be deleted. */
+   if (   DND_FILE_TRANSFER_IN_PROGRESS == mHGGetFileStatus
+       && !mHGStagingDir.empty()) {
+      uint64 totalSize = File_GetSizeEx(mHGStagingDir.c_str());
+      if (mTotalFileSize != totalSize) {
+         g_debug("%s: deleting %s, expecting %" FMT64 "u, finished %" FMT64 "u\n",
+                 __FUNCTION__, mHGStagingDir.c_str(),
+                 mTotalFileSize, totalSize);
+         DnD_DeleteStagingFiles(mHGStagingDir.c_str(), FALSE);
+      }
+   }
+   mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+   RemoveBlock();
+
+   /* Unblocks the monitor thread's read, if it is in one. */
+   TerminateThread();
+   if (mRequestFilesIdle) {
+      g_source_remove(mRequestFilesIdle);
+      mRequestFilesIdle = 0;
+   }
+   pthread_mutex_destroy(&mFileBlockMutex);
+   pthread_cond_destroy(&mFileBlockCond);
+
+   ResetFileTransfer();
+   mTransfers.CancelAll();
+   Disconnect();
+   CPClipboard_Destroy(&mClipboard);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::IsSupported --
+ *
+ *      Whether vmusr runs in a Wayland session whose compositor offers
+ *      ext-data-control-v1. VMTOOLS_CP_BACKEND=x11 or =wayland forces a
+ *      choice.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+/* static */ bool
+CopyPasteUIWayland::IsSupported()
+{
+   if (!WaylandUtil_IsWaylandSession("VMTOOLS_CP_BACKEND")) {
+      return false;
+   }
+
+   struct wl_display *display = wl_display_connect(NULL);
+   if (display == NULL) {
+      g_debug("%s: no Wayland display\n", __FUNCTION__);
+      return false;
+   }
+
+   bool found = false;
+   static struct wl_registry_listener probe;
+   probe.global = [](void *data, struct wl_registry *reg, uint32_t name,
+                     const char *iface, uint32_t version) {
+      if (strcmp(iface, ext_data_control_manager_v1_interface.name) == 0) {
+         *static_cast<bool *>(data) = true;
+      }
+   };
+   probe.global_remove = RegistryGlobalRemove;
+
+   struct wl_registry *reg = wl_display_get_registry(display);
+   wl_registry_add_listener(reg, &probe, &found);
+   wl_display_roundtrip(display);
+   wl_registry_destroy(reg);
+   wl_display_disconnect(display);
+
+   g_debug("%s: ext-data-control %d\n", __FUNCTION__, found);
+   return found;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::Init --
+ *
+ *      Connect to the compositor and hook up the common copy/paste layer.
+ *
+ * Results:
+ *      Returns true on success and false on failure.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::Init()
+{
+   TRACE_CALL();
+   if (mInited) {
+      return true;
+   }
+
+   if (!Connect()) {
+      Disconnect();
+      return false;
+   }
+
+   mCP->srcRecvClipChanged.connect(
+      sigc::mem_fun(this, &CopyPasteUIWayland::GetRemoteClipboardCB));
+   mCP->destRequestClipChanged.connect(
+      sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalClipboard));
+   mCP->getFilesDoneChanged.connect(
+      sigc::mem_fun(this, &CopyPasteUIWayland::GetLocalFilesDone));
+
+   g_debug("%s: native Wayland copy/paste\n", __FUNCTION__);
+   mInited = true;
+   return true;
+}
+
+
+void
+CopyPasteUIWayland::VmxCopyPasteVersionChanged(RpcChannel *chan,   // IN
+                                               uint32 version)     // IN
+{
+   ASSERT(mCP);
+   g_debug("%s: new version is %d\n", __FUNCTION__, version);
+   mCP->VmxCopyPasteVersionChanged(version);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::Connect --
+ *
+ *      Connect to the compositor, bind the seat and the data control
+ *      manager, and attach the connection to the default GLib main context.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::Connect()
+{
+   mDisplay = wl_display_connect(NULL);
+   if (mDisplay == NULL) {
+      g_debug("%s: wl_display_connect failed\n", __FUNCTION__);
+      return false;
+   }
+
+   mRegistry = wl_display_get_registry(mDisplay);
+   wl_registry_add_listener(mRegistry, &sRegistryListener, this);
+   wl_display_roundtrip(mDisplay);
+
+   if (mSeat == NULL || mManager == NULL) {
+      g_debug("%s: missing globals: seat %p data control manager %p\n",
+              __FUNCTION__, mSeat, mManager);
+      return false;
+   }
+
+   mDevice = ext_data_control_manager_v1_get_data_device(mManager, mSeat);
+   ext_data_control_device_v1_add_listener(mDevice, &sDeviceListener, this);
+   /* The device sends the current selection right away. */
+   wl_display_roundtrip(mDisplay);
+
+   mSource = WaylandUtil_CreateSource(mDisplay);
+   return true;
+}
+
+
+void
+CopyPasteUIWayland::Disconnect()
+{
+   DestroySource();
+   if (mSelection) {
+      ext_data_control_offer_v1_destroy(mSelection);
+      mSelection = NULL;
+   }
+   if (mPendingOffer) {
+      ext_data_control_offer_v1_destroy(mPendingOffer);
+      mPendingOffer = NULL;
+   }
+   if (mSource) {
+      g_source_destroy(mSource);
+      g_source_unref(mSource);
+      mSource = NULL;
+   }
+   if (mDevice) {
+      ext_data_control_device_v1_destroy(mDevice);
+      mDevice = NULL;
+   }
+   if (mManager) {
+      ext_data_control_manager_v1_destroy(mManager);
+      mManager = NULL;
+   }
+   if (mSeat) {
+      wl_seat_destroy(mSeat);
+      mSeat = NULL;
+   }
+   if (mRegistry) {
+      wl_registry_destroy(mRegistry);
+      mRegistry = NULL;
+   }
+   if (mDisplay) {
+      wl_display_disconnect(mDisplay);
+      mDisplay = NULL;
+   }
+}
+
+
+void
+CopyPasteUIWayland::OnRegistryGlobal(struct wl_registry *reg,   // IN
+                                     uint32 name,               // IN
+                                     const char *iface,         // IN
+                                     uint32 version)            // IN
+{
+   if (strcmp(iface, wl_seat_interface.name) == 0 && mSeat == NULL) {
+      mSeat = static_cast<struct wl_seat *>(
+         wl_registry_bind(reg, name, &wl_seat_interface, 1));
+   } else if (strcmp(iface, ext_data_control_manager_v1_interface.name) == 0) {
+      mManager = static_cast<struct ext_data_control_manager_v1 *>(
+         wl_registry_bind(reg, name, &ext_data_control_manager_v1_interface,
+                          1));
+   }
+}
+
+
+/*
+ ****************************************************************************
+ * BEGIN data control device callbacks
+ */
+
+
+void
+CopyPasteUIWayland::OnDataOffer(struct ext_data_control_offer_v1 *offer) // IN
+{
+   /* Introduces the offer of the next selection or primary_selection. */
+   if (mPendingOffer) {
+      ext_data_control_offer_v1_destroy(mPendingOffer);
+   }
+   mPendingOffer = offer;
+   mPendingOfferMimeTypes.clear();
+   ext_data_control_offer_v1_add_listener(offer, &sOfferListener, this);
+}
+
+
+void
+CopyPasteUIWayland::OnOfferMimeType(struct ext_data_control_offer_v1 *offer, // IN
+                                    const char *mimeType)                    // IN
+{
+   if (offer == mPendingOffer) {
+      mPendingOfferMimeTypes.push_back(mimeType);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::OnSelection --
+ *
+ *      The clipboard changed. Keep its offer for the host's next request,
+ *      and note whether it is a new clipboard from another client or the
+ *      host's clipboard we just set ourselves.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::OnSelection(struct ext_data_control_offer_v1 *offer) // IN
+{
+   if (mSelection) {
+      ext_data_control_offer_v1_destroy(mSelection);
+      mSelection = NULL;
+   }
+   mSelectionMimeTypes.clear();
+
+   if (offer != NULL && offer == mPendingOffer) {
+      mSelection = mPendingOffer;
+      mSelectionMimeTypes.swap(mPendingOfferMimeTypes);
+      mPendingOffer = NULL;
+   } else if (offer != NULL) {
+      /* Shouldn't happen: every offer is introduced by data_offer first. */
+      mSelection = offer;
+   }
+
+   bool ours =
+      std::find(mSelectionMimeTypes.begin(), mSelectionMimeTypes.end(),
+                OwnerMimeType()) != mSelectionMimeTypes.end();
+   if (!ours) {
+      mSelectionSerial++;
+   }
+   g_debug("%s: %s selection, %" FMTSZ "u types, serial %" FMT64 "u\n",
+           __FUNCTION__, offer == NULL ? "empty" : ours ? "our" : "new",
+           mSelectionMimeTypes.size(), mSelectionSerial);
+}
+
+
+void
+CopyPasteUIWayland::OnPrimarySelection(struct ext_data_control_offer_v1 *offer) // IN
+{
+   /*
+    * Like the host-facing clipboard in Windows and macOS, only the regular
+    * clipboard is synced; the primary selection is not ours to keep.
+    */
+   if (offer == NULL) {
+      return;
+   }
+   if (offer == mPendingOffer) {
+      mPendingOffer = NULL;
+      mPendingOfferMimeTypes.clear();
+   }
+   ext_data_control_offer_v1_destroy(offer);
+}
+
+
+void
+CopyPasteUIWayland::OnDeviceFinished()
+{
+   /*
+    * The device became invalid, e.g. the seat went away. Copy/paste stops
+    * working until vmusr resets the plugin.
+    */
+   g_warning("%s: data control device finished\n", __FUNCTION__);
+   ext_data_control_device_v1_destroy(mDevice);
+   mDevice = NULL;
+}
+
+
+/*
+ * END data control device callbacks
+ ****************************************************************************
+ */
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetRemoteClipboardCB --
+ *
+ *      Invoked when got data from host. Offer it as the guest clipboard.
+ *      Same formats and precedence as CopyPasteUIX11::GetRemoteClipboardCB:
+ *      text and RTF, else a PNG image, else a file list.
+ *
+ *      Method for copy and paste from host to guest.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::GetRemoteClipboardCB(const CPClipboard *clip) // IN
+{
+   std::vector<std::string> mimeTypes;
+   void *buf;
+   size_t sz;
+
+   TRACE_CALL();
+   if (!clip) {
+      g_debug("%s: No clipboard contents.", __FUNCTION__);
+      return;
+   }
+
+   /* A new host clipboard replaces any earlier one, files included. */
+   RemoveBlock();
+   ResetFileTransfer();
+   DestroySource();
+   mHGTextData.clear();
+   mHGRTFData.clear();
+   mHGPNGData.clear();
+   mHGFCPData.clear();
+
+   if (   CPClipboard_ItemExists(clip, CPFORMAT_TEXT)
+       || CPClipboard_ItemExists(clip, CPFORMAT_RTF)) {
+      /*
+       * rtf should be first in the target list otherwise OpenOffice may not
+       * accept paste.
+       */
+      if (CPClipboard_GetItem(clip, CPFORMAT_RTF, &buf, &sz)) {
+         g_debug("%s: RTF data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
+         mHGRTFData.assign(static_cast<const char *>(buf),
+                           strnlen(static_cast<const char *>(buf), sz));
+         mimeTypes.push_back(TARGET_NAME_TEXT_RTF);
+         mimeTypes.push_back(TARGET_NAME_APPLICATION_RTF);
+         mimeTypes.push_back(TARGET_NAME_TEXT_RICHTEXT);
+      }
+      if (CPClipboard_GetItem(clip, CPFORMAT_TEXT, &buf, &sz)) {
+         g_debug("%s: Text data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
+         mHGTextData.assign(static_cast<const char *>(buf),
+                            strnlen(static_cast<const char *>(buf), sz));
+         mimeTypes.push_back(TARGET_NAME_TEXT_PLAIN_UTF8);
+         mimeTypes.push_back(TARGET_NAME_UTF8_STRING);
+         mimeTypes.push_back(TARGET_NAME_TEXT_PLAIN);
+         mimeTypes.push_back(TARGET_NAME_STRING);
+         mimeTypes.push_back("TEXT");
+      }
+      SetSelection(mimeTypes);
+      return;
+   }
+
+   if (CPClipboard_GetItem(clip, CPFORMAT_IMG_PNG, &buf, &sz)) {
+      g_debug("%s: PNG data, size %" FMTSZ "u.\n", __FUNCTION__, sz);
+      mHGPNGData.assign(static_cast<const char *>(buf), sz);
+      mimeTypes.push_back("image/png");
+      SetSelection(mimeTypes);
+      return;
+   }
+
+   if (CPClipboard_GetItem(clip, CPFORMAT_FILELIST, &buf, &sz)) {
+      g_debug("%s: File data.\n", __FUNCTION__);
+      DnDFileList flist;
+      flist.FromCPClipboard(buf, sz);
+      mTotalFileSize = flist.GetFileSize();
+      mHGFCPData = flist.GetRelPathsStr();
+      mimeTypes.push_back(FCP_TARGET_NAME_GNOME_COPIED_FILES);
+      mimeTypes.push_back(FCP_TARGET_NAME_URI_LIST);
+      SetSelection(mimeTypes);
+      return;
+   }
+
+   if (CPClipboard_ItemExists(clip, CPFORMAT_FILECONTENTS)) {
+      /* Only Windows hosts send file contents; not handled here yet. */
+      g_debug("%s: file contents copy/paste is not supported\n",
+              __FUNCTION__);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::SetSelection --
+ *
+ *      Become the clipboard owner, offering mimeTypes plus our owner marker.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::SetSelection(const std::vector<std::string> &mimeTypes) // IN
+{
+   if (mDevice == NULL) {
+      return;
+   }
+
+   mDataSource = ext_data_control_manager_v1_create_data_source(mManager);
+   ext_data_control_source_v1_add_listener(mDataSource, &sSourceListener,
+                                           this);
+   for (size_t i = 0; i < mimeTypes.size(); i++) {
+      ext_data_control_source_v1_offer(mDataSource, mimeTypes[i].c_str());
+   }
+   ext_data_control_source_v1_offer(mDataSource, OwnerMimeType().c_str());
+   ext_data_control_device_v1_set_selection(mDevice, mDataSource);
+   wl_display_flush(mDisplay);
+   mIsClipboardOwner = true;
+}
+
+
+void
+CopyPasteUIWayland::DestroySource()
+{
+   if (mDataSource) {
+      ext_data_control_source_v1_destroy(mDataSource);
+      mDataSource = NULL;
+   }
+   mIsClipboardOwner = false;
+}
+
+
+void
+CopyPasteUIWayland::OnSourceCancelled(struct ext_data_control_source_v1 *source) // IN
+{
+   /* Another client took the clipboard. A file transfer carries on. */
+   g_debug("%s: no longer the clipboard owner\n", __FUNCTION__);
+   if (source == mDataSource) {
+      DestroySource();
+   } else {
+      ext_data_control_source_v1_destroy(source);
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::OnSourceSend --
+ *
+ *      A guest application pastes the host's clipboard. Text, RTF and PNG
+ *      are written right away. A file list starts the file transfer the
+ *      first time, then points into the vmblock file system so readers wait
+ *      for the files; without vmblock it is written once the transfer is
+ *      done, as CopyPasteUIX11 waits for it.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::OnSourceSend(struct ext_data_control_source_v1 *source, // IN
+                                 const char *mimeType,                      // IN
+                                 int32 fd)                                  // IN
+{
+   std::string target = mimeType;
+
+   g_debug("%s: paste request for %s\n", __FUNCTION__, mimeType);
+
+   if (source != mDataSource || !mCP->IsCopyPasteAllowed()) {
+      close(fd);
+      return;
+   }
+
+   if (IsFileList(target) && !mHGFCPData.empty()) {
+      if (   mHGGetFileStatus == DND_FILE_TRANSFER_NOT_STARTED
+          && !StartFileTransfer()) {
+         close(fd);
+         return;
+      }
+      std::string list = GetFileList(target);
+      g_debug("%s: providing file list [%s]\n", __FUNCTION__, list.c_str());
+      if (mBlockAdded || mHGGetFileStatus == DND_FILE_TRANSFER_FINISHED) {
+         mTransfers.Write(fd, list);
+      } else {
+         mPendingFileWrites.push_back(std::make_pair((int)fd, list));
+      }
+      return;
+   }
+
+   const std::string *data = NULL;
+   if (IsPlainText(target) && !mHGTextData.empty()) {
+      data = &mHGTextData;
+   } else if (IsRichText(target) && !mHGRTFData.empty()) {
+      data = &mHGRTFData;
+   } else if (target == "image/png" && !mHGPNGData.empty()) {
+      data = &mHGPNGData;
+   }
+
+   if (data == NULL) {
+      close(fd);
+      return;
+   }
+   g_debug("%s: providing %" FMTSZ "u bytes\n", __FUNCTION__, data->size());
+   mTransfers.Write(fd, *data);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::StartFileTransfer --
+ *
+ *      First paste of the host's files: create the staging directory and
+ *      block it in vmblock, so the transfer starts on first access (see
+ *      FileBlockMonitorThread). Without vmblock, start the transfer now.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+bool
+CopyPasteUIWayland::StartFileTransfer()
+{
+   char *dir = DnD_CreateStagingDirectory();
+
+   if (dir == NULL) {
+      g_debug("%s: Can not create staging directory\n", __FUNCTION__);
+      return false;
+   }
+   mHGStagingDir = dir;
+   free(dir);
+   g_debug("%s: staging dir %s\n", __FUNCTION__, mHGStagingDir.c_str());
+
+   mHGGetFileStatus = DND_FILE_TRANSFER_IN_PROGRESS;
+   mFilesRequested = false;
+   mBlockAdded = false;
+
+   if (   DnD_BlockIsReady(mBlockCtrl)
+       && mBlockCtrl->AddBlock(mBlockCtrl->fd, mHGStagingDir.c_str())) {
+      g_debug("%s: add block for %s.\n", __FUNCTION__, mHGStagingDir.c_str());
+      mBlockAdded = true;
+      pthread_mutex_lock(&mFileBlockMutex);
+      mFileBlockName = std::string(VMBLOCK_FUSE_NOTIFY_ROOT) + DIRSEPS +
+                       GetLastDirName(mHGStagingDir);
+      pthread_cond_signal(&mFileBlockCond);
+      pthread_mutex_unlock(&mFileBlockMutex);
+   } else {
+      g_debug("%s: unable to add block for %s, copying now.\n", __FUNCTION__,
+              mHGStagingDir.c_str());
+      RequestFiles();
+   }
+   return true;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetFileList --
+ *
+ *      The host's files as mimeType wants them: x-special/gnome-copied-files
+ *      ("copy" and newline-separated URIs) or text/uri-list.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+std::string
+CopyPasteUIWayland::GetFileList(const std::string &mimeType)   // IN
+{
+   bool gnome = mimeType == FCP_TARGET_NAME_GNOME_COPIED_FILES;
+   std::string base;
+   std::string list;
+
+   if (mBlockAdded) {
+      base = std::string(mBlockCtrl->blockRoot) + DIRSEPS +
+             GetLastDirName(mHGStagingDir);
+   } else {
+      base = mHGStagingDir;
+      while (base.size() > 1 && base[base.size() - 1] == DIRSEPC) {
+         base.erase(base.size() - 1);
+      }
+   }
+
+   if (gnome) {
+      list = "copy";
+   }
+   size_t start = 0;
+   while (start < mHGFCPData.size()) {
+      size_t end = mHGFCPData.find('\0', start);
+      if (end == std::string::npos) {
+         end = mHGFCPData.size();
+      }
+      std::string rel = mHGFCPData.substr(start, end - start);
+      start = end + 1;
+      if (rel.empty()) {
+         continue;
+      }
+
+      std::string path = base + DIRSEPS + rel;
+      gchar *uri = g_filename_to_uri(path.c_str(), NULL, NULL);
+      if (uri == NULL) {
+         continue;
+      }
+      if (gnome) {
+         /* Nautilus does not expect a newline after the last URI. */
+         list += "\n";
+         list += uri;
+      } else {
+         list += uri;
+         list += DND_URI_LIST_POST;
+      }
+      g_free(uri);
+   }
+   return list;
+}
+
+
+void
+CopyPasteUIWayland::RequestFiles()
+{
+   if (mFilesRequested || mHGGetFileStatus != DND_FILE_TRANSFER_IN_PROGRESS) {
+      return;
+   }
+   g_debug("%s: requesting files into %s\n", __FUNCTION__,
+           mHGStagingDir.c_str());
+   mFilesRequested = true;
+   /*
+    * Pass the staging directory: with no directory, the common layer creates
+    * another one, and the files would not land where the guest looks.
+    */
+   mCP->SrcUIRequestFiles(mHGStagingDir);
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetLocalFilesDone --
+ *
+ *      The host-to-guest file transfer finished. Unblock the files and
+ *      answer paste requests that were waiting for them.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::GetLocalFilesDone(bool success)   // IN
+{
+   g_debug("%s: enter success %d\n", __FUNCTION__, success);
+
+   mHGGetFileStatus = DND_FILE_TRANSFER_FINISHED;
+   RemoveBlock();
+
+   if (success) {
+      /*
+       * Mark current staging dir to be deleted on next reboot for FCP. The
+       * file will not be deleted after reboot if it is moved to another
+       * location by target application.
+       */
+      DnD_DeleteStagingFiles(mHGStagingDir.c_str(), TRUE);
+   }
+
+   for (size_t i = 0; i < mPendingFileWrites.size(); i++) {
+      if (success) {
+         mTransfers.Write(mPendingFileWrites[i].first,
+                          mPendingFileWrites[i].second);
+      } else {
+         close(mPendingFileWrites[i].first);
+      }
+   }
+   mPendingFileWrites.clear();
+
+   if (!success) {
+      /* Copied files are already removed in common layer. */
+      mHGStagingDir.clear();
+   }
+}
+
+
+void
+CopyPasteUIWayland::RemoveBlock()
+{
+   if (mBlockAdded) {
+      g_debug("%s: removing block for %s\n", __FUNCTION__,
+              mHGStagingDir.c_str());
+      mBlockAdded = false;
+      /* We need to make sure block subsystem has not been shut off. */
+      if (DnD_BlockIsReady(mBlockCtrl)) {
+         mBlockCtrl->RemoveBlock(mBlockCtrl->fd, mHGStagingDir.c_str());
+      }
+   }
+}
+
+
+void
+CopyPasteUIWayland::ResetFileTransfer()
+{
+   for (size_t i = 0; i < mPendingFileWrites.size(); i++) {
+      close(mPendingFileWrites[i].first);
+   }
+   mPendingFileWrites.clear();
+   mHGGetFileStatus = DND_FILE_TRANSFER_NOT_STARTED;
+   mFilesRequested = false;
+   mTotalFileSize = 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::FileBlockMonitorThread --
+ *
+ *    Waits for any access to the blocked staging directory, using vmblock's
+ *    notification mechanism, then has the main loop request the transfer.
+ *    Same as CopyPasteUIX11::FileBlockMonitorThread, except that the request
+ *    is made from the main loop rather than from this thread.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void *
+CopyPasteUIWayland::FileBlockMonitorThread(void *arg)   // IN
+{
+   CopyPasteUIWayland *ui = static_cast<CopyPasteUIWayland *>(arg);
+
+   pthread_mutex_lock(&ui->mFileBlockMutex);
+   while (true) {
+      pthread_cond_wait(&ui->mFileBlockCond, &ui->mFileBlockMutex);
+      if (ui->mFileBlockCondExit) {
+         break;
+      }
+      if (ui->mFileBlockName.empty()) {
+         continue;
+      }
+
+      std::string name = ui->mFileBlockName;
+      pthread_mutex_unlock(&ui->mFileBlockMutex);
+
+      int fd = open(name.c_str(), O_RDONLY);
+      if (fd < 0) {
+         g_debug("%s: Failed to open %s, errno is %d\n", __FUNCTION__,
+                 name.c_str(), errno);
+         pthread_mutex_lock(&ui->mFileBlockMutex);
+         continue;
+      }
+
+      /*
+       * Blocks until another application accesses the blocked directory,
+       * or the block is removed.
+       */
+      char buf[sizeof(VMBLOCK_FUSE_READ_RESPONSE)];
+      ssize_t size = read(fd, buf, sizeof buf);
+      g_debug("%s: Number of bytes read : %" FMTSZ "d\n", __FUNCTION__, size);
+      close(fd);
+
+      pthread_mutex_lock(&ui->mFileBlockMutex);
+      if (!ui->mFileBlockCondExit && ui->mRequestFilesIdle == 0) {
+         ui->mRequestFilesIdle = g_idle_add(RequestFilesCB, ui);
+      }
+   }
+   pthread_mutex_unlock(&ui->mFileBlockMutex);
+   return NULL;
+}
+
+
+/* static */ gboolean
+CopyPasteUIWayland::RequestFilesCB(gpointer data)   // IN
+{
+   CopyPasteUIWayland *ui = static_cast<CopyPasteUIWayland *>(data);
+
+   pthread_mutex_lock(&ui->mFileBlockMutex);
+   ui->mRequestFilesIdle = 0;
+   pthread_mutex_unlock(&ui->mFileBlockMutex);
+
+   if (ui->mBlockAdded) {
+      ui->RequestFiles();
+   } else {
+      g_debug("%s: Block is not added\n", __FUNCTION__);
+   }
+   return G_SOURCE_REMOVE;
+}
+
+
+void
+CopyPasteUIWayland::TerminateThread()
+{
+   if (mThread == 0) {
+      return;
+   }
+   pthread_mutex_lock(&mFileBlockMutex);
+   mFileBlockCondExit = true;
+   pthread_cond_signal(&mFileBlockCond);
+   pthread_mutex_unlock(&mFileBlockMutex);
+   pthread_join(mThread, NULL);
+   mThread = 0;
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::GetLocalClipboard --
+ *
+ *    The host wants the guest clipboard. Reads the current selection's data
+ *    and sends it to host, or sends a not-changed clip if no other client
+ *    set the selection since we last sent it (or we own it), or an empty
+ *    clip if there is nothing usable. For guest->host copy/paste.
+ *
+ *    Formats as in CopyPasteUIX11::LocalPrimTimestampCB: a file list, if
+ *    any, is sent alone; otherwise PNG, RTF and text are all sent.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::GetLocalClipboard()
+{
+   g_debug("%s: enter.\n", __FUNCTION__);
+
+   if (mIsClipboardOwner) {
+      g_debug("%s: we are owner, send unchanged clip back.\n", __FUNCTION__);
+      SendClipNotChanged();
+      return;
+   }
+
+   if (!mCP->IsCopyPasteAllowed()) {
+      g_debug("%s: copyPaste is not allowed\n", __FUNCTION__);
+      return;
+   }
+
+   if (mGHPendingReads > 0) {
+      g_debug("%s: still reading for the previous request\n", __FUNCTION__);
+      return;
+   }
+
+   if (mSentSerial == mSelectionSerial) {
+      g_debug("%s: clip is not changed\n", __FUNCTION__);
+      SendClipNotChanged();
+      return;
+   }
+
+   std::vector<std::string> wanted;
+
+#define OFFERED(_t) \
+   (std::find(mSelectionMimeTypes.begin(), mSelectionMimeTypes.end(), \
+              std::string(_t)) != mSelectionMimeTypes.end())
+
+   if (mSelection != NULL) {
+      if (   mCP->CheckCapability(DND_CP_CAP_FILE_CP)
+          && OFFERED(FCP_TARGET_NAME_GNOME_COPIED_FILES)) {
+         wanted.push_back(FCP_TARGET_NAME_GNOME_COPIED_FILES);
+      } else if (   mCP->CheckCapability(DND_CP_CAP_FILE_CP)
+                 && OFFERED(FCP_TARGET_NAME_URI_LIST)) {
+         wanted.push_back(FCP_TARGET_NAME_URI_LIST);
+      } else {
+         static const char *const rtfTypes[] = {
+            TARGET_NAME_TEXT_RTF, TARGET_NAME_APPLICATION_RTF,
+            TARGET_NAME_TEXT_RICHTEXT, NULL,
+         };
+         static const char *const textTypes[] = {
+            TARGET_NAME_TEXT_PLAIN_UTF8, TARGET_NAME_UTF8_STRING,
+            TARGET_NAME_TEXT_PLAIN, TARGET_NAME_STRING, NULL,
+         };
+
+         if (mCP->CheckCapability(DND_CP_CAP_IMAGE_CP) && OFFERED("image/png")) {
+            wanted.push_back("image/png");
+         }
+         for (int i = 0; mCP->CheckCapability(DND_CP_CAP_RTF_CP) && rtfTypes[i]; i++) {
+            if (OFFERED(rtfTypes[i])) {
+               wanted.push_back(rtfTypes[i]);
+               break;
+            }
+         }
+         for (int i = 0; mCP->CheckCapability(DND_CP_CAP_PLAIN_TEXT_CP) && textTypes[i]; i++) {
+            if (OFFERED(textTypes[i])) {
+               wanted.push_back(textTypes[i]);
+               break;
+            }
+         }
+      }
+   }
+
+#undef OFFERED
+
+   CPClipboard_Clear(&mClipboard);
+   mGHRequest++;
+   mGHRequestSerial = mSelectionSerial;
+
+   for (size_t i = 0; i < wanted.size(); i++) {
+      int fds[2];
+
+      if (pipe2(fds, O_CLOEXEC) < 0) {
+         g_debug("%s: pipe failed: %s\n", __FUNCTION__, strerror(errno));
+         continue;
+      }
+      ext_data_control_offer_v1_receive(mSelection, wanted[i].c_str(), fds[1]);
+      close(fds[1]);
+      mTransfers.Read(fds[0],
+                      sigc::bind(sigc::mem_fun(this,
+                                               &CopyPasteUIWayland::OnLocalDataRead),
+                                 wanted[i], mGHRequest));
+      mGHPendingReads++;
+   }
+   wl_display_flush(mDisplay);
+
+   if (mGHPendingReads == 0) {
+      g_debug("%s: got nothing, send empty clip back.\n", __FUNCTION__);
+      SendLocalClipboard();
+   }
+}
+
+
+void
+CopyPasteUIWayland::OnLocalDataRead(const std::string &data,   // IN
+                                    std::string mimeType,      // IN
+                                    uint64 request)            // IN
+{
+   g_debug("%s: got %" FMTSZ "u bytes of %s\n", __FUNCTION__, data.size(),
+           mimeType.c_str());
+   if (request != mGHRequest) {
+      return;
+   }
+   AddLocalData(mimeType, data);
+   if (--mGHPendingReads == 0) {
+      SendLocalClipboard();
+   }
+}
+
+
+/*
+ *-----------------------------------------------------------------------------
+ *
+ * CopyPasteUIWayland::AddLocalData --
+ *
+ *      Add one format read from the guest clipboard to mClipboard, with the
+ *      conversions CopyPasteUIX11 makes.
+ *
+ *-----------------------------------------------------------------------------
+ */
+
+void
+CopyPasteUIWayland::AddLocalData(const std::string &mimeType,   // IN
+                                 const std::string &data)       // IN
+{
+   if (data.empty()) {
+      return;
+   }
+
+   if (IsFileList(mimeType)) {
+      std::string source = data;
+      DnDFileList fileList;
+      DynBuf buf;
+      uint64 totalSize = 0;
+      size_t index = 0;
+      char *newPath;
+      size_t newPathLen;
+
+      g_debug("%s: Got file list: [%s]\n", __FUNCTION__, source.c_str());
+
+      /*
+       * In gnome, before file list there may be a extra line indicating it
+       * is a copy or cut.
+       */
+      if (source.compare(0, 5, "copy\n") == 0) {
+         source.erase(0, 5);
+      }
+      if (source.compare(0, 4, "cut\n") == 0) {
+         source.erase(0, 4);
+      }
+      while (source.length() > 0 &&
+             (source[0] == '\n' || source[0] == '\r' || source[0] == ' ')) {
+         source.erase(0, 1);
+      }
+
+      while ((newPath = DnD_UriListGetNextFile(source.c_str(), &index,
+                                               &newPathLen)) != NULL) {
+         if (DnD_UriIsNonFileSchemes(newPath)) {
+            /* Try to get local file path for non file uri. */
+            GFile *file = g_file_new_for_uri(newPath);
+            free(newPath);
+            newPath = file ? g_file_get_path(file) : NULL;
+            if (file) {
+               g_object_unref(file);
+            }
+            if (newPath == NULL) {
+               g_debug("%s: no local path for a non-file URI\n", __FUNCTION__);
+               continue;
+            }
+         }
+
+         char *newRelPath = Str_Strrchr(newPath, DIRSEPC) + 1;
+         int64 size = File_GetSizeEx(newPath);
+         if (size >= 0) {
+            totalSize += size;
+         } else {
+            g_debug("%s: Unable to get file size for %s\n", __FUNCTION__,
+                    newPath);
+         }
+         g_debug("%s: Adding newPath '%s' newRelPath '%s'\n", __FUNCTION__,
+                 newPath, newRelPath);
+         fileList.AddFile(newPath, newRelPath);
+         free(newPath);
+      }
+
+      DynBuf_Init(&buf);
+      fileList.SetFileSize(totalSize);
+      if (fileList.ToCPClipboard(&buf, false)) {
+         CPClipboard_SetItem(&mClipboard, CPFORMAT_FILELIST, DynBuf_Get(&buf),
+                             DynBuf_GetSize(&buf));
+      }
+      DynBuf_Destroy(&buf);
+      return;
+   }
+
+   if (data.size() > CPCLIPITEM_MAX_SIZE_V3) {
+      g_debug("%s: %s too big: %" FMTSZ "u\n", __FUNCTION__, mimeType.c_str(),
+              data.size());
+      return;
+   }
+
+   if (mimeType == "image/png") {
+      CPClipboard_SetItem(&mClipboard, CPFORMAT_IMG_PNG, data.data(),
+                          data.size());
+   } else if (IsRichText(mimeType)) {
+      /* NUL-terminated, as CopyPasteUIX11 sends it. */
+      CPClipboard_SetItem(&mClipboard, CPFORMAT_RTF, data.c_str(),
+                          data.size() + 1);
+   } else if (IsPlainText(mimeType)) {
+      CPClipboard_SetItem(&mClipboard, CPFORMAT_TEXT, data.c_str(),
+                          data.size() + 1);
+   }
+}
+
+
+void
+CopyPasteUIWayland::SendLocalClipboard()
+{
+   g_debug("%s: sending clip to host%s\n", __FUNCTION__,
+           CPClipboard_IsEmpty(&mClipboard) ? " (empty)" : "");
+   mSentSerial = mGHRequestSerial;
+   mCP->DestUISendClip(&mClipboard);
+}
+
+
+void
+CopyPasteUIWayland::SendClipNotChanged()
+{
+   CPClipboard clip;
+
+   g_debug("%s: enter.\n", __FUNCTION__);
+   CPClipboard_Init(&clip);
+   CPClipboard_SetChanged(&clip, FALSE);
+   mCP->DestUISendClip(&clip);
+   CPClipboard_Destroy(&clip);
+}
+
+
+std::string
+CopyPasteUIWayland::GetLastDirName(const std::string &str)   // IN
+{
+   char *baseName;
+   std::string stripSlash = str;
+   char *path = File_StripSlashes(stripSlash.c_str());
+   if (path) {
+      stripSlash = path;
+      free(path);
+   }
+
+   File_GetPathName(stripSlash.c_str(), NULL, &baseName);
+   if (baseName) {
+      std::string s(baseName);
+      free(baseName);
+      return s;
+   }
+   return std::string();
+}
+
+
+std::string
+CopyPasteUIWayland::OwnerMimeType()
+{
+   char *s = Str_Asprintf(NULL, GUEST_CP_OWNER_FMT, static_cast<int>(getpid()));
+   std::string ret = s ? s : "";
+   free(s);
+   return ret;
+}
+
+
+/* static */ bool
+CopyPasteUIWayland::IsPlainText(const std::string &mimeType)
+{
+   return    mimeType == TARGET_NAME_TEXT_PLAIN_UTF8
+          || mimeType == TARGET_NAME_UTF8_STRING
+          || mimeType == TARGET_NAME_TEXT_PLAIN
+          || mimeType == TARGET_NAME_STRING
+          || mimeType == "TEXT";
+}
+
+
+/* static */ bool
+CopyPasteUIWayland::IsRichText(const std::string &mimeType)
+{
+   return    mimeType == TARGET_NAME_TEXT_RTF
+          || mimeType == TARGET_NAME_APPLICATION_RTF
+          || mimeType == TARGET_NAME_TEXT_RICHTEXT;
+}
+
+
+/* static */ bool
+CopyPasteUIWayland::IsFileList(const std::string &mimeType)
+{
+   return    mimeType == FCP_TARGET_NAME_GNOME_COPIED_FILES
+          || mimeType == FCP_TARGET_NAME_URI_LIST;
+}
